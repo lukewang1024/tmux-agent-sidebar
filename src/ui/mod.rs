@@ -13,7 +13,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
 };
 
-use crate::{state::AppState, tmux};
+use crate::{
+    state::{AppState, Focus},
+    tmux,
+};
 
 pub const BOTTOM_PANEL_HEIGHT: u16 = 20;
 
@@ -56,9 +59,39 @@ pub fn pet_enabled_from_tmux() -> bool {
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.layout.hyperlink_overlays.clear();
     let area = frame.area();
+    // Cache the viewport height so keyboard handlers (which lack a terminal
+    // handle) can resolve bottom-panel visibility for toggles and focus moves.
+    state.last_viewport_height = area.height;
 
+    let (compact, shown) = state.bottom_visibility(area.height);
+
+    // Keep focus consistent with what is actually on screen. When the panel
+    // is hidden, focus must not linger in the invisible Activity log; in the
+    // compact accordion the list is hidden, so focus lives in the panel.
+    if !shown {
+        if state.focus_state.focus == Focus::ActivityLog {
+            state.focus_state.focus = Focus::Panes;
+        }
+    } else if compact {
+        state.focus_state.focus = Focus::ActivityLog;
+    }
+
+    // Compact + shown: the bottom panel takes over the whole viewport as an
+    // accordion; the list is hidden until toggled back with `b`.
+    if shown && compact {
+        bottom::draw_bottom(frame, state, area);
+        return;
+    }
+
+    // Bottom hidden: the list gets the full height.
+    if !shown {
+        panes::draw_agents(frame, state, area);
+        return;
+    }
+
+    // Tall window: list + divider + fixed bottom panel, as before.
     let bot_h = state.bottom_panel_height;
-    let divider_h = if bot_h > 0 && state.pet_enabled {
+    let divider_h = if state.pet_enabled {
         PET_SCENE_HEIGHT
     } else {
         1
@@ -66,25 +99,18 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if bot_h > 0 {
-            vec![
-                Constraint::Min(1),
-                Constraint::Length(divider_h),
-                Constraint::Length(bot_h),
-            ]
-        } else {
-            vec![Constraint::Min(1)]
-        })
+        .constraints(vec![
+            Constraint::Min(1),
+            Constraint::Length(divider_h),
+            Constraint::Length(bot_h),
+        ])
         .split(area);
 
     panes::draw_agents(frame, state, chunks[0]);
-
-    if bot_h > 0 && chunks.len() > 2 {
-        bottom::draw_bottom(frame, state, chunks[2]);
-        if state.pet_enabled {
-            let running_count = state.running_count();
-            pet::draw_pet(frame, state, chunks[1], running_count);
-        }
+    bottom::draw_bottom(frame, state, chunks[2]);
+    if state.pet_enabled {
+        let running_count = state.running_count();
+        pet::draw_pet(frame, state, chunks[1], running_count);
     }
 }
 

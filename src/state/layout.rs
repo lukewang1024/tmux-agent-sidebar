@@ -68,6 +68,51 @@ pub(super) fn point_in_rect(row: u16, col: u16, rect: ratatui::layout::Rect) -> 
 }
 
 impl AppState {
+    /// Minimum rows the agent/session list must keep before the fixed bottom
+    /// panel is allowed to share the viewport. Below this the layout switches
+    /// to "compact": the bottom panel auto-hides so the list keeps the full
+    /// height, and the user toggles it back in on demand (see the `b` key).
+    pub const COMPACT_LIST_MIN: u16 = 10;
+
+    /// Resolve, for a viewport of `height` rows, `(compact, shown)`:
+    ///
+    /// * `compact` — the fixed bottom panel would leave the list fewer than
+    ///   [`COMPACT_LIST_MIN`] rows, i.e. `height < bottom_height + MIN`. In
+    ///   compact mode the panel renders as a full-height accordion over the
+    ///   list rather than a split beneath it.
+    /// * `shown` — whether the bottom panel is rendered at all. Defaults to
+    ///   `!compact` (shown on tall windows, hidden on short ones) unless the
+    ///   user pinned an explicit choice with [`toggle_bottom_panel`]. Always
+    ///   `false` when `@sidebar_bottom_height` is 0 (panel disabled).
+    pub fn bottom_visibility(&self, height: u16) -> (bool, bool) {
+        if self.bottom_panel_height == 0 {
+            return (false, false);
+        }
+        let compact = height < self.bottom_panel_height.saturating_add(Self::COMPACT_LIST_MIN);
+        let shown = self.bottom_override.unwrap_or(!compact);
+        (compact, shown)
+    }
+
+    /// Whether the bottom panel is visible at the last rendered viewport
+    /// height. Keyboard handlers use this (they have no terminal handle) to
+    /// avoid descending focus into a hidden Activity log.
+    pub fn bottom_panel_visible(&self) -> bool {
+        self.bottom_visibility(self.last_viewport_height).1
+    }
+
+    /// Flip bottom-panel visibility relative to what is currently shown,
+    /// pinning the result as an explicit override. On a tall window this
+    /// hides the panel to reclaim list space; on a short window it reveals
+    /// the panel as a full-height accordion over the list. No-op when the
+    /// panel is disabled (`@sidebar_bottom_height` = 0).
+    pub fn toggle_bottom_panel(&mut self) {
+        if self.bottom_panel_height == 0 {
+            return;
+        }
+        let (_, shown) = self.bottom_visibility(self.last_viewport_height);
+        self.bottom_override = Some(!shown);
+    }
+
     pub fn rebuild_row_targets(&mut self) {
         // Reset stale repo filter if the repo no longer exists, and
         // persist the reset back to tmux so fresh sidebar instances do
@@ -275,5 +320,67 @@ impl AppState {
             self.global.queue_cursor_save();
             self.activate_selected_pane();
         }
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use crate::state::AppState;
+
+    fn state_with_bottom(height: u16) -> AppState {
+        let mut s = AppState::new("%99".into());
+        s.bottom_panel_height = height;
+        s
+    }
+
+    #[test]
+    fn tall_window_shows_both_by_default() {
+        let s = state_with_bottom(20);
+        // 50 >= 20 + COMPACT_LIST_MIN(10) -> not compact, shown.
+        assert_eq!(s.bottom_visibility(50), (false, true));
+    }
+
+    #[test]
+    fn short_window_auto_hides_bottom() {
+        let s = state_with_bottom(20);
+        // Threshold is 20 + 10 = 30: below it is compact + hidden, at/above
+        // it is roomy + shown.
+        assert_eq!(s.bottom_visibility(29), (true, false));
+        assert_eq!(s.bottom_visibility(30), (false, true));
+    }
+
+    #[test]
+    fn zero_height_option_always_hidden() {
+        let s = state_with_bottom(0);
+        assert_eq!(s.bottom_visibility(100), (false, false));
+    }
+
+    #[test]
+    fn toggle_reveals_on_short_and_hides_on_tall() {
+        let mut s = state_with_bottom(20);
+
+        // Short window: hidden by default, toggle reveals then hides again.
+        s.last_viewport_height = 25;
+        assert!(!s.bottom_panel_visible());
+        s.toggle_bottom_panel();
+        assert!(s.bottom_panel_visible());
+        s.toggle_bottom_panel();
+        assert!(!s.bottom_panel_visible());
+
+        // Tall window: shown by default, toggle hides it to reclaim list space.
+        s.bottom_override = None;
+        s.last_viewport_height = 60;
+        assert!(s.bottom_panel_visible());
+        s.toggle_bottom_panel();
+        assert!(!s.bottom_panel_visible());
+    }
+
+    #[test]
+    fn toggle_is_noop_when_panel_disabled() {
+        let mut s = state_with_bottom(0);
+        s.last_viewport_height = 100;
+        s.toggle_bottom_panel();
+        assert_eq!(s.bottom_override, None);
+        assert!(!s.bottom_panel_visible());
     }
 }

@@ -122,6 +122,17 @@ pub struct AppState {
     /// Height of the bottom panel in lines. Loaded once at startup from
     /// the `@sidebar_bottom_height` tmux option. A value of 0 hides the panel.
     pub bottom_panel_height: u16,
+    /// Explicit user override for bottom-panel visibility, set by the `b`
+    /// toggle key. `None` means "follow the automatic height-responsive
+    /// rule" (shown on tall windows, auto-hidden on short ones); `Some(true)`
+    /// forces it shown, `Some(false)` forces it hidden. See
+    /// [`AppState::bottom_visibility`].
+    pub bottom_override: Option<bool>,
+    /// Viewport height (rows) captured on the last render. Read by keyboard
+    /// handlers — which have no terminal handle — so toggles and focus moves
+    /// can resolve the current bottom-panel visibility. See
+    /// [`AppState::bottom_panel_visible`].
+    pub last_viewport_height: u16,
     /// Maps session_id → session name, refreshed periodically from
     /// `~/.claude/sessions/*.json` files. The `dirty` flag is `true` when
     /// the map has changed since the last `refresh_session_names`
@@ -179,6 +190,8 @@ impl AppState {
             version_notice: None,
             global: GlobalState::new(),
             bottom_panel_height: crate::ui::BOTTOM_PANEL_HEIGHT,
+            bottom_override: None,
+            last_viewport_height: 0,
             sessions: SessionNamesState::new(),
             pet_enabled: false,
         };
