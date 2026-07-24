@@ -20,6 +20,30 @@ pub(crate) fn cmd_toggle(args: &[String]) -> i32 {
     };
     let pane_path = positional.get(1).copied().unwrap_or("~");
 
+    // Auto-create width gate. Only the programmatic `--create-only` path is
+    // gated, so a manual `prefix + e` toggle can still summon a sidebar in a
+    // narrow window. `@sidebar_auto_create_min_width` of 0 (the default)
+    // disables the gate; otherwise skip creation when the window is narrower
+    // than the minimum (e.g. no room for the sidebar plus a usable main pane).
+    if create_only {
+        let min_width: u32 = tmux::display_message(
+            window_id,
+            &format!("#{{{}}}", tmux::SIDEBAR_AUTO_CREATE_MIN_WIDTH),
+        )
+        .trim()
+        .parse()
+        .unwrap_or(0);
+        if min_width > 0 {
+            let window_width: u32 = tmux::display_message(window_id, "#{window_width}")
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if auto_create_blocked_by_width(min_width, window_width) {
+                return 0;
+            }
+        }
+    }
+
     // Check sidebar width setting
     let sidebar_width_setting = {
         let s = tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_WIDTH));
@@ -346,9 +370,30 @@ fn pane_id_role_format() -> String {
     format!("#{{pane_id}}|#{{{}}}", tmux::PANE_ROLE)
 }
 
+/// Whether an auto-create should be skipped because the window is narrower
+/// than the configured minimum. The caller only invokes this with
+/// `min_width > 0`. A `window_width` of 0 means the query failed / is unknown;
+/// we do NOT block on that, since a false skip would silently drop the sidebar
+/// on a perfectly normal window — better to create than to mysteriously not.
+fn auto_create_blocked_by_width(min_width: u32, window_width: u32) -> bool {
+    window_width != 0 && window_width < min_width
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_create_width_gate() {
+        // Below the minimum → skip.
+        assert!(auto_create_blocked_by_width(149, 100));
+        assert!(auto_create_blocked_by_width(149, 148));
+        // At or above the minimum → allow.
+        assert!(!auto_create_blocked_by_width(149, 149));
+        assert!(!auto_create_blocked_by_width(149, 320));
+        // Unknown width (query failed → 0) → do not block.
+        assert!(!auto_create_blocked_by_width(149, 0));
+    }
 
     #[test]
     fn any_sidebar_pane_detects_sidebar_anywhere() {

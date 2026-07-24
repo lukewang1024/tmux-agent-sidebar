@@ -89,6 +89,10 @@ pub const SIDEBAR_FILTER: &str = "@sidebar_filter";
 pub const SIDEBAR_CURSOR: &str = "@sidebar_cursor";
 pub const SIDEBAR_REPO_FILTER: &str = "@sidebar_repo_filter";
 pub const SIDEBAR_BOTTOM_HEIGHT: &str = "@sidebar_bottom_height";
+/// Minimum window width (columns) for auto-create (`--create-only`) to place a
+/// sidebar. 0 (the default) means no gate. A manual `prefix + e` toggle is
+/// never gated, so it can always summon a sidebar regardless of width.
+pub const SIDEBAR_AUTO_CREATE_MIN_WIDTH: &str = "@sidebar_auto_create_min_width";
 pub const SIDEBAR_PET: &str = "@sidebar_pet";
 pub const SIDEBAR_NOTIFICATIONS: &str = "@sidebar_notifications";
 pub const SIDEBAR_NOTIFICATIONS_EVENTS: &str = "@sidebar_notifications_events";
