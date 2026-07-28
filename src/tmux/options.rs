@@ -94,6 +94,12 @@ pub const SIDEBAR_BOTTOM_HEIGHT: &str = "@sidebar_bottom_height";
 /// never gated, so it can always summon a sidebar regardless of width.
 pub const SIDEBAR_AUTO_CREATE_MIN_WIDTH: &str = "@sidebar_auto_create_min_width";
 pub const SIDEBAR_PET: &str = "@sidebar_pet";
+/// Opt-in theme-adaptive palette. When on, defaults come from the terminal's
+/// own 16-color ANSI palette (plus its default foreground) instead of fixed
+/// xterm-256 indexes, so the sidebar follows the terminal's light/dark theme.
+/// Off by default (the classic 256-color palette). `@sidebar_color_*`
+/// overrides still apply on top of whichever base is chosen.
+pub const SIDEBAR_ANSI_THEME: &str = "@sidebar_ansi_theme";
 pub const SIDEBAR_NOTIFICATIONS: &str = "@sidebar_notifications";
 pub const SIDEBAR_NOTIFICATIONS_EVENTS: &str = "@sidebar_notifications_events";
 
