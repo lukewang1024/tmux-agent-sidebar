@@ -528,9 +528,20 @@ fn compact_window_auto_hides_bottom_panel() {
     assert_eq!(state.bottom_panel_height, 20);
 
     let out = render_to_string(&mut state, 28, 14);
-    // No bottom-panel tab title row, and the repo/pane list is present.
-    assert!(!out.contains("Activity"), "bottom panel should be hidden:\n{out}");
-    assert!(out.contains("project"), "session list should be visible:\n{out}");
+    // The panel content box is hidden — only the collapsed drawer handle names
+    // it — and the repo/pane list is present.
+    assert!(
+        !out.contains("╭ Activity"),
+        "bottom panel box should be hidden:\n{out}"
+    );
+    assert!(
+        out.contains("▸ Activity / Git"),
+        "collapsed drawer handle should be shown:\n{out}"
+    );
+    assert!(
+        out.contains("project"),
+        "session list should be visible:\n{out}"
+    );
 }
 
 /// Toggling the panel on a short window reveals it as a full-height accordion
@@ -552,5 +563,26 @@ fn compact_window_accordion_reveals_bottom_panel() {
     assert!(
         first.trim_start().starts_with('╭'),
         "accordion panel should own the top row, got: {first:?}"
+    );
+}
+
+/// An open popup must stay visible over the compact accordion. The accordion
+/// path draws the bottom panel (not the list), which historically skipped the
+/// popup overlay, so an open popup vanished until the panel was collapsed.
+#[test]
+fn compact_accordion_keeps_open_popup_visible() {
+    let pane = make_pane(AgentType::Claude, PaneStatus::Running);
+    let mut state = make_state(vec![]);
+    state.repo_groups = vec![make_repo_group("project", vec![pane])];
+    state.rebuild_row_targets();
+    state.focus_state.sidebar_focused = true;
+    state.last_viewport_height = 14; // compact (< 20 + 10)
+    state.toggle_bottom_panel(); // reveal the accordion
+    state.open_spawn_input_for_repo("project".into(), "/tmp/project".into(), None);
+
+    let out = render_to_string(&mut state, 28, 14);
+    assert!(
+        out.contains("Spawn worktree"),
+        "spawn popup must render over the compact accordion:\n{out}"
     );
 }

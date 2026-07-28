@@ -123,6 +123,7 @@ fn test_running_icon_blink_off() {
     ⓘ                        — ▾
     project
     ┃ ● claude
+     ▸ Activity / Git       [b]
     ");
 }
 
@@ -149,6 +150,7 @@ fn test_running_spinner_frame_advances() {
     ⓘ                        — ▾
     project
     ┃ ● claude
+     ▸ Activity / Git       [b]
     ");
 }
 
@@ -174,6 +176,7 @@ fn test_waiting_icon() {
     ⓘ                        — ▾
     project
     ┃ ◐ claude
+     ▸ Activity / Git       [b]
     ");
 }
 
@@ -199,6 +202,7 @@ fn test_error_icon() {
     ⓘ                        — ▾
     project
     ┃ ✕ claude
+     ▸ Activity / Git       [b]
     ");
 }
 

@@ -36,7 +36,9 @@ pub(super) fn handle_event(
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let bottom_start = term_height.saturating_sub(bottom_h);
-                    if mouse.row < bottom_start {
+                    if state.handle_bottom_toggle_click(mouse.row, mouse.column) {
+                        // Drawer handle on a compact window: toggled the panel.
+                    } else if mouse.row < bottom_start {
                         state.handle_mouse_click(mouse.row, mouse.column);
                     } else if mouse.row == bottom_start {
                         state.handle_bottom_tab_click(mouse.column);
