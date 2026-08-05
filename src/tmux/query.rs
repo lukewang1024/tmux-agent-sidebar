@@ -263,9 +263,12 @@ fn parse_pane_fields_with_processes(
         return None;
     }
 
-    let agent = AgentType::from_label(&parts[pane_line_field::AGENT])?;
     let current_command = parts[pane_line_field::PANE_CURRENT_COMMAND].as_str();
     let pane_pid: Option<u32> = parts[pane_line_field::PANE_PID].parse().ok();
+    let configured_agent = AgentType::from_label(&parts[pane_line_field::AGENT]);
+    let process_discovered = configured_agent.is_none();
+    let agent = configured_agent
+        .or_else(|| discover_process_agent(current_command, pane_pid, process_snapshot))?;
 
     // Codex / OpenCode panes can leave stale tmux metadata behind after the
     // agent exits and the pane falls back to the user's shell. Neither
@@ -319,7 +322,11 @@ fn parse_pane_fields_with_processes(
 
     Some(PaneInfo {
         pane_active: parts[pane_line_field::PANE_ACTIVE] == "1",
-        status: PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]),
+        status: if process_discovered {
+            PaneStatus::Idle
+        } else {
+            PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS])
+        },
         attention: !parts[pane_line_field::PANE_ATTENTION].is_empty(),
         agent,
         path,
@@ -348,6 +355,36 @@ fn parse_pane_fields_with_processes(
             }
         },
     })
+}
+
+/// Discover hook-less agents during the gap between launching their TUI and
+/// the first lifecycle event. Codex currently delays SessionStart until the
+/// first prompt creates a conversation, so relying exclusively on
+/// `@pane_agent` makes a freshly launched pane invisible. Prefer the exact
+/// foreground command so discovery still works when `ps` is unavailable, then
+/// fall back to the pane's process tree for wrapper/shell launchers.
+fn discover_process_agent(
+    current_command: &str,
+    pane_pid: Option<u32>,
+    process_snapshot: Option<&ProcessSnapshot>,
+) -> Option<AgentType> {
+    let command = current_command
+        .split_whitespace()
+        .next()
+        .map(command_basename)
+        .unwrap_or("");
+
+    match command {
+        CODEX_AGENT => return Some(AgentType::Codex),
+        "opencode" => return Some(AgentType::OpenCode),
+        _ => {}
+    }
+
+    let pid = pane_pid?;
+    let snapshot = process_snapshot?;
+    [AgentType::Codex, AgentType::OpenCode]
+        .into_iter()
+        .find(|agent| snapshot.tree_has_agent(&[pid], agent))
 }
 
 /// Wipe all agent-tracked tmux pane options and the activity log file for
@@ -907,6 +944,52 @@ mod tests {
             parse_pane_line(&line).is_none(),
             "empty agent should be rejected"
         );
+    }
+
+    #[test]
+    fn parse_pane_line_discovers_codex_before_first_hook() {
+        let mut fields = full_fields();
+        fields[pane_line_field::AGENT] = "";
+        fields[pane_line_field::PANE_STATUS] = "";
+        fields[pane_line_field::PANE_CURRENT_COMMAND] = "/opt/homebrew/bin/codex";
+
+        let pane = parse_pane_line(&make_pane_line(&fields))
+            .expect("a running Codex TUI should be visible before SessionStart fires");
+
+        assert_eq!(pane.agent, AgentType::Codex);
+        assert_eq!(pane.status, PaneStatus::Idle);
+        assert!(pane.session_id.is_none());
+    }
+
+    #[test]
+    fn parse_pane_fields_discovers_hookless_opencode_from_process_tree() {
+        let mut fields = full_fields();
+        fields[pane_line_field::AGENT] = "";
+        fields[pane_line_field::PANE_STATUS] = "";
+        fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
+        fields[pane_line_field::PANE_PID] = "300";
+        let fields = field_strings(&fields);
+        let snapshot = process_snapshot(
+            "300 1 zsh zsh -c opencode\n301 300 opencode /usr/local/bin/opencode\n",
+        );
+
+        let pane = parse_pane_fields_with_processes(&fields, Some(&snapshot))
+            .expect("a hookless OpenCode child process should be discovered");
+
+        assert_eq!(pane.agent, AgentType::OpenCode);
+        assert_eq!(pane.status, PaneStatus::Idle);
+    }
+
+    #[test]
+    fn parse_pane_fields_does_not_discover_an_ordinary_shell() {
+        let mut fields = full_fields();
+        fields[pane_line_field::AGENT] = "";
+        fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
+        fields[pane_line_field::PANE_PID] = "400";
+        let fields = field_strings(&fields);
+        let snapshot = process_snapshot("400 1 zsh -zsh\n401 400 git git status\n");
+
+        assert!(parse_pane_fields_with_processes(&fields, Some(&snapshot)).is_none());
     }
 
     #[test]
