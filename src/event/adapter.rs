@@ -93,11 +93,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_stop_has_no_response() {
+    fn claude_stop_has_noop_json_response() {
         let adapter = resolve_adapter("claude").unwrap();
         let event = adapter.parse("stop", &json!({})).unwrap();
         match event {
-            AgentEvent::Stop { response, .. } => assert!(response.is_none()),
+            AgentEvent::Stop { response, .. } => assert_eq!(response.as_deref(), Some("{}")),
             other => panic!("expected Stop, got {:?}", other),
         }
     }

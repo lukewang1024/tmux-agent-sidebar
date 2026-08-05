@@ -1,4 +1,8 @@
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 
 use crate::tmux;
 
@@ -20,11 +24,17 @@ pub(crate) fn cmd_toggle(args: &[String]) -> i32 {
     };
     let pane_path = positional.get(1).copied().unwrap_or("~");
 
-    // Auto-create width gate. Only the programmatic `--create-only` path is
-    // gated, so a manual `prefix + e` toggle can still summon a sidebar in a
-    // narrow window. `@sidebar_auto_create_min_width` of 0 (the default)
-    // disables the gate; otherwise skip creation when the window is narrower
-    // than the minimum (e.g. no room for the sidebar plus a usable main pane).
+    // `client-resized` and `after-resize-pane` hooks run in the background and
+    // may reach this check/create sequence concurrently. Serialize it per tmux
+    // window so two processes cannot both observe "no sidebar" and split one.
+    let _create_lock = match SidebarCreateLock::acquire(window_id) {
+        Some(lock) => lock,
+        None => return 0,
+    };
+
+    // Optional extra auto-create width gate. The built-in sidebar + main-area
+    // fit check below applies to every creation path; this legacy option lets
+    // users impose an even larger threshold on programmatic creation only.
     if create_only {
         let min_width: u32 = tmux::display_message(
             window_id,
@@ -47,30 +57,16 @@ pub(crate) fn cmd_toggle(args: &[String]) -> i32 {
     // Check sidebar width setting
     let sidebar_width_setting = {
         let s = tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_WIDTH));
-        if s.is_empty() { "30".to_string() } else { s }
+        if s.is_empty() { "48".to_string() } else { s }
     };
 
-    let sidebar_width = if sidebar_width_setting.ends_with('%') {
-        let window_width: u32 = tmux::display_message(window_id, "#{window_width}")
-            .parse()
-            .unwrap_or(0);
-        let pct: u32 = sidebar_width_setting
-            .trim_end_matches('%')
-            .parse()
-            .unwrap_or(15);
-        if window_width > 0 && pct > 0 {
-            let w = window_width * pct / 100;
-            if w < 1 {
-                "1".to_string()
-            } else {
-                w.to_string()
-            }
-        } else {
-            sidebar_width_setting
-        }
-    } else {
-        sidebar_width_setting
-    };
+    let window_width = tmux::display_message(window_id, "#{window_width}")
+        .parse()
+        .unwrap_or(0);
+    let resolved_sidebar_width = resolve_sidebar_width(&sidebar_width_setting, window_width);
+    let sidebar_width = resolved_sidebar_width
+        .map(|width| width.to_string())
+        .unwrap_or(sidebar_width_setting);
 
     let sidebar_position = SidebarPosition::from_setting(&tmux::display_message(
         window_id,
@@ -82,20 +78,44 @@ pub(crate) fn cmd_toggle(args: &[String]) -> i32 {
     let panes_output = tmux::run_tmux(&["list-panes", "-t", window_id, "-F", &pane_id_role_format])
         .unwrap_or_default();
 
-    let existing_sidebar = panes_output.lines().find_map(|line| {
-        let parts: Vec<&str> = line.splitn(2, '|').collect();
-        if parts.len() >= 2 && parts[1] == "sidebar" {
-            Some(parts[0].to_string())
-        } else {
-            None
-        }
-    });
+    let existing_sidebars = sidebar_panes(&panes_output);
 
-    if let Some(sidebar_pane) = existing_sidebar {
+    if let Some((sidebar_pane, duplicate_sidebars)) = existing_sidebars.split_first() {
+        // Heal panes left behind by an older racing implementation. A
+        // create-only request preserves one; a manual toggle removes all.
+        for duplicate in duplicate_sidebars {
+            let _ = tmux::run_tmux(&["kill-pane", "-t", duplicate]);
+        }
         if create_only {
             return 0;
         }
-        let _ = tmux::run_tmux(&["kill-pane", "-t", &sidebar_pane]);
+        clear_auto_hidden_marker(window_id);
+        let _ = tmux::run_tmux(&["kill-pane", "-t", sidebar_pane]);
+        return 0;
+    }
+
+    // Apply the responsive rule before splitting so a narrow new window never
+    // flashes an unusable sidebar and immediately removes it. The auto-hidden
+    // marker lets a later client resize restore it at the same fixed width.
+    let main_min_width =
+        tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_MAIN_MIN_WIDTH))
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(80);
+    if resolved_sidebar_width
+        .is_some_and(|width| !responsive_sidebar_fits(window_width, width, main_min_width))
+    {
+        if create_only {
+            let _ = tmux::run_tmux(&["set", "-w", "-t", window_id, tmux::SIDEBAR_AUTO_HIDDEN, "1"]);
+            let _ = tmux::run_tmux(&[
+                "set",
+                "-w",
+                "-t",
+                window_id,
+                tmux::SIDEBAR_AUTO_HIDDEN_PATH,
+                pane_path,
+            ]);
+        }
         return 0;
     }
 
@@ -141,6 +161,7 @@ pub(crate) fn cmd_toggle(args: &[String]) -> i32 {
 
     if !sidebar_pane.is_empty() {
         tmux::set_pane_option(&sidebar_pane, tmux::PANE_ROLE, "sidebar");
+        clear_auto_hidden_marker(window_id);
     }
 
     // Restore focus
@@ -151,6 +172,45 @@ pub(crate) fn cmd_toggle(args: &[String]) -> i32 {
     }
 
     0
+}
+
+/// Advisory process lock for the non-atomic tmux "list panes, then split"
+/// sequence. `flock` is released by the kernel even if a hook process crashes;
+/// the small persistent file is only the lock's rendezvous point.
+struct SidebarCreateLock {
+    file: File,
+}
+
+impl SidebarCreateLock {
+    fn acquire(window_id: &str) -> Option<Self> {
+        let path = sidebar_create_lock_path(window_id);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .ok()?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        (result == 0).then_some(Self { file })
+    }
+}
+
+impl Drop for SidebarCreateLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn sidebar_create_lock_path(window_id: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    std::env::var("TMUX").unwrap_or_default().hash(&mut hasher);
+    window_id.hash(&mut hasher);
+    std::env::temp_dir().join(format!(
+        "tmux-agent-sidebar-create-{:016x}.lock",
+        hasher.finish()
+    ))
 }
 
 pub(crate) fn cmd_toggle_all(_args: &[String]) -> i32 {
@@ -185,11 +245,199 @@ pub(crate) fn cmd_toggle_all(_args: &[String]) -> i32 {
     0
 }
 
+/// Restore the configured sidebar width after tmux has squeezed the layout
+/// during a client resize. The configured width is reapplied in both
+/// directions so tmux cannot proportionally squeeze or expand the sidebar.
+pub(crate) fn cmd_maintain_width(args: &[String]) -> i32 {
+    let Some(window_id) = args.first().map(String::as_str) else {
+        return 0;
+    };
+
+    let window_width = tmux::display_message(window_id, "#{window_width}")
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let setting = tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_WIDTH));
+    let Some(preferred_width) = resolve_sidebar_width(&setting, window_width) else {
+        return 0;
+    };
+    let min_width = sidebar_bound(window_id, tmux::SIDEBAR_MIN_WIDTH, 36, window_width);
+    let max_width =
+        sidebar_bound(window_id, tmux::SIDEBAR_MAX_WIDTH, 64, window_width).max(min_width);
+    let preferred_width = preferred_width.clamp(min_width, max_width);
+    let main_min_width =
+        tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_MAIN_MIN_WIDTH))
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(80);
+
+    let pane_format = format!("#{{pane_id}}|#{{pane_width}}|#{{{}}}", tmux::PANE_ROLE);
+    let panes =
+        tmux::run_tmux(&["list-panes", "-t", window_id, "-F", &pane_format]).unwrap_or_default();
+
+    let sidebar = panes.lines().find_map(|line| {
+        let mut fields = line.splitn(3, '|');
+        let (Some(pane_id), Some(current_width), Some(role)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return None;
+        };
+        (role == "sidebar").then(|| (pane_id.to_string(), current_width.to_string()))
+    });
+
+    // The remembered width is indivisible: either it and the minimum main
+    // area both fit, or the sidebar stays hidden. Never squeeze the sidebar to
+    // an intermediate width while the terminal is changing size.
+    if !responsive_sidebar_fits(window_width, preferred_width, main_min_width) {
+        if let Some((pane_id, _)) = sidebar {
+            let path = tmux::display_message(&pane_id, "#{pane_current_path}");
+            let _ = tmux::run_tmux(&["set", "-w", "-t", window_id, tmux::SIDEBAR_AUTO_HIDDEN, "1"]);
+            if !path.is_empty() {
+                let _ = tmux::run_tmux(&[
+                    "set",
+                    "-w",
+                    "-t",
+                    window_id,
+                    tmux::SIDEBAR_AUTO_HIDDEN_PATH,
+                    &path,
+                ]);
+            }
+            let _ = tmux::run_tmux(&["kill-pane", "-t", &pane_id]);
+        }
+        return 0;
+    }
+
+    if let Some((pane_id, current_width)) = sidebar {
+        if sidebar_width_changed(&current_width, preferred_width) {
+            let preferred_width = preferred_width.to_string();
+            let _ = tmux::run_tmux(&[
+                "set",
+                "-w",
+                "-t",
+                window_id,
+                tmux::SIDEBAR_ADJUSTING_WIDTH,
+                &preferred_width,
+            ]);
+            let _ = tmux::run_tmux(&["resize-pane", "-t", &pane_id, "-x", &preferred_width]);
+        }
+        return 0;
+    }
+
+    let auto_hidden =
+        tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_AUTO_HIDDEN));
+    if auto_hidden == "1" {
+        let path = tmux::display_message(
+            window_id,
+            &format!("#{{{}}}", tmux::SIDEBAR_AUTO_HIDDEN_PATH),
+        );
+        let toggle_args = vec![
+            "--create-only".to_string(),
+            window_id.to_string(),
+            if path.is_empty() {
+                "~".to_string()
+            } else {
+                path
+            },
+        ];
+        cmd_toggle(&toggle_args);
+        return cmd_maintain_width(args);
+    }
+
+    0
+}
+
+/// Persist a mouse/key-resized sidebar width at window scope. New windows keep
+/// the global default, while this window retains the user's chosen width across
+/// terminal resizes and responsive hide/show cycles.
+pub(crate) fn cmd_remember_width(args: &[String]) -> i32 {
+    let (Some(window_id), Some(pane_id)) = (args.first(), args.get(1)) else {
+        return 0;
+    };
+    if tmux::display_message(pane_id, &format!("#{{{}}}", tmux::PANE_ROLE)) != "sidebar" {
+        return 0;
+    }
+    let automatic_width = tmux::display_message(
+        window_id,
+        &format!("#{{{}}}", tmux::SIDEBAR_ADJUSTING_WIDTH),
+    );
+    let observed_width = tmux::display_message(pane_id, "#{pane_width}");
+    if !automatic_width.is_empty() {
+        let _ = tmux::run_tmux(&["set", "-wu", "-t", window_id, tmux::SIDEBAR_ADJUSTING_WIDTH]);
+        if automatic_width == observed_width {
+            return 0;
+        }
+    }
+    let window_width = tmux::display_message(window_id, "#{window_width}")
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let min_width = sidebar_bound(window_id, tmux::SIDEBAR_MIN_WIDTH, 36, window_width);
+    let max_width =
+        sidebar_bound(window_id, tmux::SIDEBAR_MAX_WIDTH, 64, window_width).max(min_width);
+    let max_percent = tmux::display_message(
+        window_id,
+        &format!("#{{{}}}", tmux::SIDEBAR_MAX_WIDTH_PERCENT),
+    )
+    .trim()
+    .parse::<u32>()
+    .ok()
+    .filter(|percent| *percent > 0)
+    .unwrap_or(30);
+    let main_min_width =
+        tmux::display_message(window_id, &format!("#{{{}}}", tmux::SIDEBAR_MAIN_MIN_WIDTH))
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(80);
+    if let Ok(observed_width) = observed_width.parse::<u32>() {
+        // Reject out-of-range observations instead of clamping and issuing a
+        // second resize, which visibly made the pane jump twice during drag.
+        if drag_width_range(
+            window_width,
+            min_width,
+            max_width,
+            max_percent,
+            main_min_width,
+        )
+        .is_some_and(|range| range.contains(&observed_width))
+        {
+            let width = observed_width.to_string();
+            let _ = tmux::run_tmux(&["set", "-w", "-t", window_id, tmux::SIDEBAR_WIDTH, &width]);
+        }
+    }
+    0
+}
+
+fn sidebar_bound(window_id: &str, option: &str, fallback: u32, window_width: u32) -> u32 {
+    resolve_sidebar_width(
+        tmux::display_message(window_id, &format!("#{{{option}}}")).trim(),
+        window_width,
+    )
+    .unwrap_or(fallback)
+}
+
+fn clear_auto_hidden_marker(window_id: &str) {
+    let _ = tmux::run_tmux(&["set", "-wu", "-t", window_id, tmux::SIDEBAR_AUTO_HIDDEN]);
+    let _ = tmux::run_tmux(&[
+        "set",
+        "-wu",
+        "-t",
+        window_id,
+        tmux::SIDEBAR_AUTO_HIDDEN_PATH,
+    ]);
+}
+
 fn any_sidebar_pane(output: &str) -> bool {
-    output.lines().any(|line| {
-        let parts: Vec<&str> = line.splitn(2, '|').collect();
-        parts.len() >= 2 && parts[1] == "sidebar"
-    })
+    !sidebar_panes(output).is_empty()
+}
+
+fn sidebar_panes(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (pane_id, role) = line.split_once('|')?;
+            (role == "sidebar").then(|| pane_id.to_string())
+        })
+        .collect()
 }
 
 fn unique_window_paths(output: &str) -> Vec<(String, String)> {
@@ -379,6 +627,46 @@ fn auto_create_blocked_by_width(min_width: u32, window_width: u32) -> bool {
     window_width != 0 && window_width < min_width
 }
 
+fn resolve_sidebar_width(setting: &str, window_width: u32) -> Option<u32> {
+    let setting = setting.trim();
+    if let Some(percent) = setting.strip_suffix('%') {
+        let percent: u32 = percent.parse().ok()?;
+        if percent == 0 || window_width == 0 {
+            return None;
+        }
+        return Some((window_width.saturating_mul(percent) / 100).max(1));
+    }
+
+    setting.parse::<u32>().ok().filter(|width| *width > 0)
+}
+
+fn sidebar_width_changed(current_width: &str, desired_width: u32) -> bool {
+    current_width
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|current| current != desired_width)
+}
+
+fn responsive_sidebar_fits(window_width: u32, sidebar_width: u32, main_min_width: u32) -> bool {
+    window_width
+        >= sidebar_width
+            .saturating_add(main_min_width)
+            .saturating_add(1)
+}
+
+fn drag_width_range(
+    window_width: u32,
+    min_width: u32,
+    max_width: u32,
+    max_percent: u32,
+    main_min_width: u32,
+) -> Option<std::ops::RangeInclusive<u32>> {
+    let percent_cap = window_width.saturating_mul(max_percent) / 100;
+    let main_area_cap = window_width.saturating_sub(main_min_width.saturating_add(1));
+    let effective_max = max_width.min(percent_cap).min(main_area_cap);
+    (effective_max >= min_width).then_some(min_width..=effective_max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +684,42 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_width_resolves_columns_and_percentages() {
+        assert_eq!(resolve_sidebar_width("48", 160), Some(48));
+        assert_eq!(resolve_sidebar_width("15%", 200), Some(30));
+        assert_eq!(resolve_sidebar_width("1%", 40), Some(1));
+        assert_eq!(resolve_sidebar_width("0%", 200), None);
+        assert_eq!(resolve_sidebar_width("15%", 0), None);
+        assert_eq!(resolve_sidebar_width("invalid", 200), None);
+    }
+
+    #[test]
+    fn sidebar_width_is_restored_after_shrink_or_growth() {
+        assert!(sidebar_width_changed("12", 48));
+        assert!(!sidebar_width_changed("48", 48));
+        assert!(sidebar_width_changed("60", 48));
+        assert!(!sidebar_width_changed("invalid", 48));
+    }
+
+    #[test]
+    fn responsive_sidebar_reserves_main_content_width_and_border() {
+        assert!(!responsive_sidebar_fits(148, 48, 100));
+        assert!(responsive_sidebar_fits(149, 48, 100));
+        assert!(responsive_sidebar_fits(200, 48, 100));
+    }
+
+    #[test]
+    fn drag_width_range_combines_absolute_percentage_and_main_area_caps() {
+        assert_eq!(drag_width_range(110, 36, 64, 30, 80), None);
+        assert_eq!(drag_width_range(120, 36, 64, 30, 80), Some(36..=36));
+        assert_eq!(drag_width_range(140, 36, 64, 30, 80), Some(36..=42));
+        assert_eq!(drag_width_range(160, 36, 64, 30, 80), Some(36..=48));
+        assert_eq!(drag_width_range(200, 36, 64, 30, 80), Some(36..=60));
+        assert_eq!(drag_width_range(240, 36, 64, 30, 80), Some(36..=64));
+        assert_eq!(drag_width_range(320, 36, 64, 30, 80), Some(36..=64));
+    }
+
+    #[test]
     fn any_sidebar_pane_detects_sidebar_anywhere() {
         let output = "%1|pane\n%2|sidebar\n%3|pane";
         assert!(any_sidebar_pane(output));
@@ -405,6 +729,15 @@ mod tests {
     fn any_sidebar_pane_returns_false_without_sidebar() {
         let output = "%1|pane\n%2|main";
         assert!(!any_sidebar_pane(output));
+    }
+
+    #[test]
+    fn sidebar_panes_returns_every_duplicate_for_reconciliation() {
+        let output = "%1|sidebar\n%2|main\n%3|sidebar\nmalformed";
+        assert_eq!(
+            sidebar_panes(output),
+            vec!["%1".to_string(), "%3".to_string()]
+        );
     }
 
     #[test]

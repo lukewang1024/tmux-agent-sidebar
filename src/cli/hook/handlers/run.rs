@@ -4,6 +4,7 @@ use crate::desktop_notification::DesktopNotificationKind;
 use crate::tmux;
 
 use crate::time::now_epoch_secs;
+use std::path::{Path, PathBuf};
 
 use super::super::context::{
     AgentContext, clear_run_state, is_system_message, mark_task_reset, set_agent_meta,
@@ -38,13 +39,28 @@ pub(in crate::cli::hook) fn on_stop(
     pane: &str,
     ctx: &AgentContext<'_>,
     last_message: &str,
+    transcript_path: &str,
     response: Option<&str>,
     notifications: &desktop_notification::DesktopNotificationSettings,
 ) -> i32 {
     set_agent_meta(pane, ctx);
     set_attention(pane, "clear");
-    if !last_message.is_empty() {
-        let msg = sanitize_tmux_value(last_message);
+    let transcript_fallback = if last_message.is_empty() {
+        last_assistant_message_from_transcript(transcript_path).or_else(|| {
+            ctx.session_id
+                .as_deref()
+                .and_then(last_assistant_message_from_codex_session)
+        })
+    } else {
+        None
+    };
+    let visible_message = if last_message.is_empty() {
+        transcript_fallback.as_deref().unwrap_or("")
+    } else {
+        last_message
+    };
+    if !visible_message.is_empty() {
+        let msg = sanitize_tmux_value(visible_message);
         tmux::set_pane_option(pane, tmux::PANE_PROMPT, &msg);
         tmux::set_pane_option(pane, tmux::PANE_PROMPT_SOURCE, "response");
     }
@@ -84,7 +100,7 @@ pub(in crate::cli::hook) fn on_stop(
                     kind: DesktopNotificationKind::TaskCompleted,
                     event: desktop_notification::DesktopNotificationEvent::Stop,
                     fingerprint_suffix: "stop",
-                    body: &stop_body(last_message),
+                    body: &stop_body(visible_message),
                 },
             );
         }
@@ -93,6 +109,70 @@ pub(in crate::cli::hook) fn on_stop(
         println!("{resp}");
     }
     0
+}
+
+fn last_assistant_message_from_transcript(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let transcript = std::fs::read_to_string(path).ok()?;
+    last_assistant_message_from_jsonl(&transcript)
+}
+
+fn last_assistant_message_from_codex_session(session_id: &str) -> Option<String> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    let transcript = find_session_transcript(&codex_home.join("sessions"), session_id)?;
+    last_assistant_message_from_transcript(transcript.to_str()?)
+}
+
+fn find_session_transcript(root: &Path, session_id: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_session_transcript(&path, session_id) {
+                return Some(found);
+            }
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn last_assistant_message_from_jsonl(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let message = value.get("message").or_else(|| value.get("payload"))?;
+        if message.get("role").and_then(|role| role.as_str()) != Some("assistant") {
+            return None;
+        }
+        let content = message.get("content")?.as_array()?;
+        let text = content
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = item.as_str() {
+                    return Some(text);
+                }
+                match item.get("type").and_then(|kind| kind.as_str()) {
+                    Some("text" | "output_text") => item.get("text").and_then(|text| text.as_str()),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then_some(text)
+    })
 }
 
 pub(in crate::cli::hook) fn on_stop_failure(
@@ -149,6 +229,44 @@ pub(in crate::cli::hook) fn on_task_completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_fallback_reads_latest_codex_assistant_message() {
+        let transcript = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"older"}]}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final result"}]}}"#;
+
+        assert_eq!(
+            last_assistant_message_from_jsonl(transcript).as_deref(),
+            Some("final result")
+        );
+    }
+
+    #[test]
+    fn transcript_fallback_reads_claude_assistant_message() {
+        let transcript = r#"{"type":"user","message":{"role":"user","content":"fix it"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"fixed"}]}}"#;
+
+        assert_eq!(
+            last_assistant_message_from_jsonl(transcript).as_deref(),
+            Some("fixed")
+        );
+    }
+
+    #[test]
+    fn transcript_lookup_finds_codex_session_by_id() {
+        let root = tempfile::tempdir().unwrap();
+        let dated = root.path().join("2026/08/05");
+        std::fs::create_dir_all(&dated).unwrap();
+        let transcript = dated.join("rollout-2026-08-05T00-00-00-session-abc.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+
+        assert_eq!(
+            find_session_transcript(root.path(), "session-abc"),
+            Some(transcript)
+        );
+        assert_eq!(find_session_transcript(root.path(), "missing"), None);
+    }
 
     #[test]
     fn on_user_prompt_submit_sets_running_and_stores_prompt() {
@@ -241,6 +359,7 @@ mod tests {
             pane,
             &ctx,
             "",
+            "",
             None,
             &desktop_notification::DesktopNotificationSettings {
                 enabled: false,
@@ -276,6 +395,7 @@ mod tests {
             pane,
             &ctx,
             "",
+            "",
             None,
             &desktop_notification::DesktopNotificationSettings {
                 enabled: false,
@@ -310,6 +430,7 @@ mod tests {
         on_stop(
             pane,
             &ctx,
+            "",
             "",
             None,
             &desktop_notification::DesktopNotificationSettings {

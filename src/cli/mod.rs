@@ -21,6 +21,8 @@ pub fn run(args: &[String]) -> Option<i32> {
         "hook" => hook::cmd_hook(rest),
         "toggle" => toggle::cmd_toggle(rest),
         "toggle-all" => toggle::cmd_toggle_all(rest),
+        "maintain-width" => toggle::cmd_maintain_width(rest),
+        "remember-width" => toggle::cmd_remember_width(rest),
         "auto-close" => toggle::cmd_auto_close(rest),
         "set-status" => cmd_set_status(rest),
         "spawn" => spawn::cmd_spawn(rest),

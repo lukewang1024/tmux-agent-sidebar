@@ -33,6 +33,7 @@ pub(in crate::cli::hook) fn make_ctx<'a>(
 
 pub(in crate::cli::hook) fn set_agent_meta(pane: &str, ctx: &AgentContext<'_>) {
     tmux::set_pane_option(pane, tmux::PANE_AGENT, ctx.agent);
+    tmux::unset_pane_option(pane, tmux::PANE_AGENT_MISSING_SINCE);
     // `@pane_permission_mode` is parent-owned: a child agent can be in
     // a different mode (e.g. plan vs. default) and overwriting the
     // parent's value here would flip the badge mid-session. Gate the
@@ -56,6 +57,7 @@ pub(in crate::cli::hook) fn is_system_message(s: &str) -> bool {
 pub(in crate::cli::hook) fn clear_all_meta(pane: &str) {
     for key in &[
         tmux::PANE_AGENT,
+        tmux::PANE_AGENT_MISSING_SINCE,
         tmux::PANE_PROMPT,
         tmux::PANE_PROMPT_SOURCE,
         tmux::PANE_BG_CMD,

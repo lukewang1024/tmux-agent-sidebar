@@ -75,6 +75,9 @@ pub const PANE_SUBAGENTS: &str = "@pane_subagents";
 /// Reason the pane is in `waiting` status (`permission`,
 /// `session_resumed`, etc.).
 pub const PANE_WAIT_REASON: &str = "@pane_wait_reason";
+/// Epoch timestamp for the first process-discovery miss while a pane still
+/// carries agent metadata. Debounces transient `ps` gaps before cleanup.
+pub const PANE_AGENT_MISSING_SINCE: &str = "@pane_agent_missing_since";
 /// Branch name when the pane is attached to a git worktree.
 pub const PANE_WORKTREE_BRANCH: &str = "@pane_worktree_branch";
 /// Worktree slug (directory basename) for the attached worktree.
@@ -84,15 +87,25 @@ pub const PANE_WORKTREE_NAME: &str = "@pane_worktree_name";
 
 pub const SIDEBAR_PID: &str = "@sidebar_pid";
 pub const SIDEBAR_WIDTH: &str = "@sidebar_width";
+pub const SIDEBAR_MIN_WIDTH: &str = "@sidebar_min_width";
+pub const SIDEBAR_MAX_WIDTH: &str = "@sidebar_max_width";
+pub const SIDEBAR_MAX_WIDTH_PERCENT: &str = "@sidebar_max_width_percent";
 pub const SIDEBAR_POSITION: &str = "@sidebar_position";
 pub const SIDEBAR_FILTER: &str = "@sidebar_filter";
 pub const SIDEBAR_CURSOR: &str = "@sidebar_cursor";
 pub const SIDEBAR_REPO_FILTER: &str = "@sidebar_repo_filter";
 pub const SIDEBAR_BOTTOM_HEIGHT: &str = "@sidebar_bottom_height";
-/// Minimum window width (columns) for auto-create (`--create-only`) to place a
-/// sidebar. 0 (the default) means no gate. A manual `prefix + e` toggle is
-/// never gated, so it can always summon a sidebar regardless of width.
+/// Optional additional minimum window width for auto-create (`--create-only`).
+/// 0 (the default) leaves sizing to the built-in sidebar + main-area fit rule.
 pub const SIDEBAR_AUTO_CREATE_MIN_WIDTH: &str = "@sidebar_auto_create_min_width";
+/// Minimum width reserved for the non-sidebar content area. When the window
+/// cannot fit this plus the configured sidebar width, the sidebar auto-hides.
+pub const SIDEBAR_MAIN_MIN_WIDTH: &str = "@sidebar_main_min_width";
+/// Window-local marker recording that the sidebar was hidden responsively,
+/// rather than toggled off by the user.
+pub const SIDEBAR_AUTO_HIDDEN: &str = "@sidebar_auto_hidden";
+pub const SIDEBAR_AUTO_HIDDEN_PATH: &str = "@sidebar_auto_hidden_path";
+pub const SIDEBAR_ADJUSTING_WIDTH: &str = "@sidebar_adjusting_width";
 pub const SIDEBAR_PET: &str = "@sidebar_pet";
 /// Opt-in theme-adaptive palette. When on, defaults come from the terminal's
 /// own 16-color ANSI palette (plus its default foreground) instead of fixed

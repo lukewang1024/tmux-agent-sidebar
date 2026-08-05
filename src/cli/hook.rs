@@ -95,6 +95,7 @@ fn handle_event(pane: &str, agent_name: &str, event: AgentEvent) -> i32 {
             cwd,
             permission_mode,
             last_message,
+            transcript_path,
             response,
             worktree,
             session_id,
@@ -105,6 +106,7 @@ fn handle_event(pane: &str, agent_name: &str, event: AgentEvent) -> i32 {
                 pane,
                 &context::make_ctx(&agent, &cwd, &permission_mode, &worktree, &session_id),
                 &last_message,
+                &transcript_path,
                 response.as_deref(),
                 &notifications,
             )

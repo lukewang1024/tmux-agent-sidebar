@@ -94,6 +94,7 @@ impl EventAdapter for OpenCodeAdapter {
                 cwd: json_str(input, "cwd").into(),
                 permission_mode: String::new(),
                 last_message: json_str(input, "last_message").into(),
+                transcript_path: json_str(input, "transcript_path").into(),
                 response: None,
                 worktree: None,
                 agent_id: None,

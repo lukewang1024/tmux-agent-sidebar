@@ -5,10 +5,11 @@ use crate::process::{ProcessSnapshot, command_basename};
 
 use super::commands::run_tmux;
 use super::options::{
-    PANE_AGENT, PANE_ATTENTION, PANE_BG_CMD, PANE_CWD, PANE_NAME, PANE_PENDING_SESSION_END,
-    PANE_PENDING_WORKTREE_REMOVE, PANE_PERMISSION_MODE, PANE_PROMPT, PANE_PROMPT_SOURCE, PANE_ROLE,
-    PANE_SESSION_ID, PANE_STARTED_AT, PANE_STATUS, PANE_SUBAGENTS, PANE_WAIT_REASON,
-    PANE_WORKTREE_BRANCH, PANE_WORKTREE_NAME, unset_pane_option,
+    PANE_AGENT, PANE_AGENT_MISSING_SINCE, PANE_ATTENTION, PANE_BG_CMD, PANE_CWD, PANE_NAME,
+    PANE_PENDING_SESSION_END, PANE_PENDING_WORKTREE_REMOVE, PANE_PERMISSION_MODE, PANE_PROMPT,
+    PANE_PROMPT_SOURCE, PANE_ROLE, PANE_SESSION_ID, PANE_STARTED_AT, PANE_STATUS, PANE_SUBAGENTS,
+    PANE_WAIT_REASON, PANE_WORKTREE_BRANCH, PANE_WORKTREE_NAME, get_pane_option_value,
+    set_pane_option, unset_pane_option,
 };
 use super::types::{
     AgentType, CODEX_AGENT, PaneInfo, PaneStatus, PermissionMode, SessionInfo, WindowInfo,
@@ -281,14 +282,31 @@ fn parse_pane_fields_with_processes(
     // because its SessionEnd hook drives cleanup instead.
     if matches!(agent, AgentType::Codex | AgentType::OpenCode) && is_shell_command(current_command)
     {
-        let agent_still_alive = pane_pid
-            .and_then(|pid| {
-                process_snapshot.map(|snapshot| snapshot.tree_has_agent(&[pid], &agent))
-            })
-            .unwrap_or(false);
-        if !agent_still_alive {
-            clear_agent_pane_state(&parts[pane_line_field::PANE_ID]);
-            return None;
+        let pane_id = &parts[pane_line_field::PANE_ID];
+        if let (Some(pid), Some(snapshot)) = (pane_pid, process_snapshot) {
+            if snapshot.tree_has_agent(&[pid], &agent) {
+                unset_pane_option(pane_id, PANE_AGENT_MISSING_SINCE);
+            } else {
+                let now = crate::time::now_epoch_secs();
+                let missing_since = get_pane_option_value(pane_id, PANE_AGENT_MISSING_SINCE)
+                    .parse::<u64>()
+                    .ok();
+                if process_miss_exceeded_grace(missing_since, now) {
+                    // Codex can transiently disappear from the pane's process
+                    // tree while its TUI remains alive between turns. Hide the
+                    // item for this snapshot, but retain its final response and
+                    // session metadata. A real next SessionStart clears stale
+                    // state before accepting another prompt. OpenCode lacks the
+                    // same reliable lifecycle reset, so it keeps eager cleanup.
+                    if agent == AgentType::OpenCode {
+                        clear_agent_pane_state(pane_id);
+                    }
+                    return None;
+                }
+                if missing_since.is_none() {
+                    set_pane_option(pane_id, PANE_AGENT_MISSING_SINCE, &now.to_string());
+                }
+            }
         }
     }
 
@@ -388,10 +406,10 @@ fn discover_process_agent(
 }
 
 /// Wipe all agent-tracked tmux pane options and the activity log file for
-/// `pane_id`. Triggered by `parse_pane_fields` when it detects a Codex or
-/// OpenCode pane that has dropped back to the user's shell, since neither
-/// CLI fires a reliable process-exit hook. Claude panes are never routed
-/// here because Claude has its own SessionEnd hook. The set of keys
+/// `pane_id`. Triggered when OpenCode has dropped back to the user's shell.
+/// Codex process-tree misses only hide the item and deliberately retain its
+/// last result until the next SessionStart; Claude has its own SessionEnd
+/// hook. The set of keys
 /// mirrors `clear_all_meta` + `clear_run_state` + status/attention clears
 /// in `src/cli/hook/context.rs`; keep them in sync when a new `@pane_*`
 /// key is added.
@@ -413,12 +431,18 @@ fn clear_agent_pane_state(pane_id: &str) {
         PANE_WAIT_REASON,
         PANE_ATTENTION,
         PANE_STATUS,
+        PANE_AGENT_MISSING_SINCE,
     ];
     for key in KEYS {
         unset_pane_option(pane_id, key);
     }
     let log_path = crate::activity::log_file_path(pane_id);
     let _ = std::fs::remove_file(log_path);
+}
+
+fn process_miss_exceeded_grace(missing_since: Option<u64>, now: u64) -> bool {
+    const PROCESS_MISS_GRACE_SECS: u64 = 5;
+    missing_since.is_some_and(|since| now.saturating_sub(since) >= PROCESS_MISS_GRACE_SECS)
 }
 
 fn is_shell_command(command: &str) -> bool {
@@ -1036,27 +1060,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_line_rejects_stale_codex_shell_pane() {
+    fn parse_pane_line_preserves_codex_metadata_without_process_snapshot() {
         let mut fields = full_fields();
         fields[3] = "codex";
         fields[6] = "zsh";
         let line = make_pane_line(&fields);
-        assert!(
-            parse_pane_line(&line).is_none(),
-            "codex metadata on a shell pane should be treated as stale"
-        );
+        assert!(parse_pane_line(&line).is_some());
     }
 
     #[test]
-    fn parse_pane_line_rejects_stale_codex_shell_pane_with_path_and_args() {
+    fn parse_pane_line_preserves_codex_metadata_when_process_state_is_unknown() {
         let mut fields = full_fields();
         fields[3] = "codex";
         fields[6] = "/usr/local/bin/PwSh -l";
         let line = make_pane_line(&fields);
-        assert!(
-            parse_pane_line(&line).is_none(),
-            "shell detection should handle paths, args, and case differences"
-        );
+        assert!(parse_pane_line(&line).is_some());
     }
 
     #[test]
@@ -1142,11 +1160,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_line_wipes_stale_state_for_codex_shell_pane() {
-        // Codex shares the same shell-fallback sweep path as OpenCode —
-        // neither fires a reliable process-exit hook, so the Rust poller
-        // must clear @pane_* keys and the activity log when the pane
-        // reverts to a shell. Mirrors the OpenCode regression test below.
+    fn transient_codex_process_miss_preserves_last_result() {
+        let _guard = test_mock::install();
+        let pane = "%CODEX_TRANSIENT_MISS";
+        test_mock::set(pane, PANE_AGENT, "codex");
+        test_mock::set(pane, PANE_PROMPT, "last completed result");
+        test_mock::set(pane, PANE_PROMPT_SOURCE, "response");
+
+        let mut fields = full_fields();
+        fields[pane_line_field::PANE_ID] = pane;
+        fields[pane_line_field::AGENT] = "codex";
+        fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
+        fields[pane_line_field::PANE_PID] = "200";
+        fields[pane_line_field::PROMPT] = "last completed result";
+        fields[pane_line_field::PROMPT_SOURCE] = "response";
+        let fields = field_strings(&fields);
+        let snapshot = process_snapshot("200 1 zsh zsh\n");
+
+        let pane_info = parse_pane_fields_with_processes(&fields, Some(&snapshot))
+            .expect("a first process miss must be debounced");
+
+        assert_eq!(pane_info.prompt, "last completed result");
+        assert!(pane_info.prompt_is_response);
+        assert!(test_mock::contains(pane, PANE_AGENT_MISSING_SINCE));
+        assert!(test_mock::contains(pane, PANE_PROMPT));
+    }
+
+    #[test]
+    fn codex_process_exit_hides_item_but_preserves_last_result() {
         let _guard = test_mock::install();
         let pane = "%CODEX_STALE";
         test_mock::set(pane, PANE_AGENT, "codex");
@@ -1156,6 +1197,11 @@ mod tests {
         test_mock::set(pane, PANE_STARTED_AT, "1700000000");
         test_mock::set(pane, PANE_CWD, "/repo/codex");
         test_mock::set(pane, PANE_WAIT_REASON, "permission");
+        test_mock::set(
+            pane,
+            PANE_AGENT_MISSING_SINCE,
+            &(crate::time::now_epoch_secs() - 10).to_string(),
+        );
         let log = crate::activity::log_file_path(pane);
         let _ = std::fs::create_dir_all(log.parent().unwrap());
         std::fs::write(&log, "1234|Bash|pytest\n").unwrap();
@@ -1164,9 +1210,10 @@ mod tests {
         fields[pane_line_field::PANE_ID] = pane;
         fields[pane_line_field::AGENT] = "codex";
         fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
-        let line = make_pane_line(&fields);
+        let fields = field_strings(&fields);
+        let snapshot = process_snapshot("999 1 zsh zsh\n");
 
-        assert!(parse_pane_line(&line).is_none());
+        assert!(parse_pane_fields_with_processes(&fields, Some(&snapshot)).is_none());
         for key in &[
             PANE_AGENT,
             PANE_PROMPT,
@@ -1176,14 +1223,11 @@ mod tests {
             PANE_CWD,
             PANE_WAIT_REASON,
         ] {
-            assert!(
-                !test_mock::contains(pane, key),
-                "{key} must be cleared when a codex pane falls back to shell"
-            );
+            assert!(test_mock::contains(pane, key), "{key} must be retained");
         }
         assert!(
-            !log.exists(),
-            "codex activity log must be removed once the agent process is gone"
+            log.exists(),
+            "Codex activity must survive a process-tree miss until SessionStart resets it"
         );
     }
 
@@ -1203,6 +1247,11 @@ mod tests {
         test_mock::set(pane, PANE_STARTED_AT, "1700000000");
         test_mock::set(pane, PANE_CWD, "/repo");
         test_mock::set(pane, PANE_SESSION_ID, "ses-1");
+        test_mock::set(
+            pane,
+            PANE_AGENT_MISSING_SINCE,
+            &(crate::time::now_epoch_secs() - 10).to_string(),
+        );
         let log = crate::activity::log_file_path(pane);
         let _ = std::fs::create_dir_all(log.parent().unwrap());
         std::fs::write(&log, "1234|Bash|ls\n").unwrap();
@@ -1211,9 +1260,10 @@ mod tests {
         fields[pane_line_field::PANE_ID] = pane;
         fields[pane_line_field::AGENT] = "opencode";
         fields[pane_line_field::PANE_CURRENT_COMMAND] = "fish";
-        let line = make_pane_line(&fields);
+        let fields = field_strings(&fields);
+        let snapshot = process_snapshot("999 1 fish fish\n");
 
-        assert!(parse_pane_line(&line).is_none());
+        assert!(parse_pane_fields_with_processes(&fields, Some(&snapshot)).is_none());
         for key in &[
             PANE_AGENT,
             PANE_PROMPT,

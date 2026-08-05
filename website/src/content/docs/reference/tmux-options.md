@@ -11,7 +11,11 @@ Most options must be set **before** loading the plugin in your `tmux.conf`. Colo
 | -------------------------------- | ------- | --------------------------------------------------------------------------------------- |
 | `@sidebar_key`                   | `e`     | Prefix-triggered keybinding to toggle the sidebar in the current window                 |
 | `@sidebar_key_all`               | `E`     | Prefix-triggered keybinding to toggle the sidebar in all windows                        |
-| `@sidebar_width`                 | `15%`   | Width in columns or as a percentage                                                     |
+| `@sidebar_width`                 | `48`    | Fixed initial width in columns; dragging a sidebar remembers a per-window column width |
+| `@sidebar_min_width`             | `36`    | Minimum draggable width that may be remembered                                        |
+| `@sidebar_max_width`             | `64`    | Absolute maximum draggable width that may be remembered                               |
+| `@sidebar_max_width_percent`     | `30`    | Percentage cap for a remembered drag; combined with the absolute cap and main-area reservation |
+| `@sidebar_main_min_width`        | `80`    | Minimum columns reserved for main content; the fixed-width sidebar is hidden unless both areas fit in full |
 | `@sidebar_position`              | `left`  | Sidebar placement (`left` or `right`)                                                   |
 | `@sidebar_bottom_height`         | `20`    | Bottom panel height in lines (set `0` to hide)                                          |
 | `@sidebar_auto_create`           | `on`    | Auto-create the sidebar on new windows (set `off` to disable)                           |
@@ -112,6 +116,10 @@ Any Unicode glyph works. Make sure the glyphs render in your terminal font.
 # Behavior
 set -g @sidebar_key T
 set -g @sidebar_width 32
+set -g @sidebar_min_width 36
+set -g @sidebar_max_width 64
+set -g @sidebar_max_width_percent 30
+set -g @sidebar_main_min_width 80
 set -g @sidebar_position right
 set -g @sidebar_bottom_height 25
 set -g @sidebar_notifications_events "stop,notification"

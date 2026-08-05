@@ -172,7 +172,11 @@ impl EventAdapter for ClaudeAdapter {
                 cwd: json_str(input, "cwd").into(),
                 permission_mode: json_str(input, "permission_mode").into(),
                 last_message: json_str(input, "last_assistant_message").into(),
-                response: None,
+                transcript_path: json_str(input, "transcript_path").into(),
+                // Valid no-op JSON for both Claude and Codex Stop protocols.
+                // This also keeps a stale Claude-labelled command in Codex
+                // config from aborting later Stop hooks with empty stdout.
+                response: Some("{}".into()),
                 worktree: parse_worktree(input),
                 agent_id: optional_str(input, "agent_id"),
                 session_id: optional_str(input, "session_id"),

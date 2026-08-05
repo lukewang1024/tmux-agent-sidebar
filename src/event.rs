@@ -59,6 +59,7 @@ pub enum AgentEvent {
         cwd: String,
         permission_mode: String,
         last_message: String,
+        transcript_path: String,
         response: Option<String>,
         worktree: Option<WorktreeInfo>,
         agent_id: Option<String>,
