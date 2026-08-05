@@ -63,6 +63,8 @@ pub const PANE_ROLE: &str = "@pane_role";
 /// Agent-provided session id, surfaced in the status line for
 /// quick reference.
 pub const PANE_SESSION_ID: &str = "@pane_session_id";
+/// Cached Codex transcript path used when a turn completes without a Stop hook.
+pub const PANE_TRANSCRIPT_PATH: &str = "@pane_transcript_path";
 /// Epoch-seconds timestamp of the current run's start — drives
 /// the "running for Xs" label.
 pub const PANE_STARTED_AT: &str = "@pane_started_at";

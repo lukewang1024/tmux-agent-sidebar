@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use crate::process::{ProcessSnapshot, command_basename};
 
@@ -8,8 +9,8 @@ use super::options::{
     PANE_AGENT, PANE_AGENT_MISSING_SINCE, PANE_ATTENTION, PANE_BG_CMD, PANE_CWD, PANE_NAME,
     PANE_PENDING_SESSION_END, PANE_PENDING_WORKTREE_REMOVE, PANE_PERMISSION_MODE, PANE_PROMPT,
     PANE_PROMPT_SOURCE, PANE_ROLE, PANE_SESSION_ID, PANE_STARTED_AT, PANE_STATUS, PANE_SUBAGENTS,
-    PANE_WAIT_REASON, PANE_WORKTREE_BRANCH, PANE_WORKTREE_NAME, get_pane_option_value,
-    set_pane_option, unset_pane_option,
+    PANE_TRANSCRIPT_PATH, PANE_WAIT_REASON, PANE_WORKTREE_BRANCH, PANE_WORKTREE_NAME,
+    get_pane_option_value, set_pane_option, unset_pane_option,
 };
 use super::types::{
     AgentType, CODEX_AGENT, PaneInfo, PaneStatus, PermissionMode, SessionInfo, WindowInfo,
@@ -271,6 +272,25 @@ fn parse_pane_fields_with_processes(
     let agent = configured_agent
         .or_else(|| discover_process_agent(current_command, pane_pid, process_snapshot))?;
 
+    let pane_id = &parts[pane_line_field::PANE_ID];
+    let stored_status = PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]);
+    let session_id_value = &parts[pane_line_field::SESSION_ID];
+    let transcript_completion = if agent == AgentType::Codex
+        && matches!(stored_status, PaneStatus::Running | PaneStatus::Waiting)
+        && !session_id_value.is_empty()
+    {
+        codex_completed_response(pane_id, session_id_value)
+    } else {
+        None
+    };
+    if let Some(message) = transcript_completion.as_deref() {
+        set_pane_option(pane_id, PANE_PROMPT, message);
+        set_pane_option(pane_id, PANE_PROMPT_SOURCE, "response");
+        set_pane_option(pane_id, PANE_STATUS, "idle");
+        unset_pane_option(pane_id, PANE_STARTED_AT);
+        unset_pane_option(pane_id, PANE_WAIT_REASON);
+    }
+
     // Codex / OpenCode panes can leave stale tmux metadata behind after the
     // agent exits and the pane falls back to the user's shell. Neither
     // agent exposes a reliable "process exit" hook (Codex has no such
@@ -326,11 +346,15 @@ fn parse_pane_fields_with_processes(
         PermissionMode::Default
     };
 
-    let prompt_source = &parts[pane_line_field::PROMPT_SOURCE];
-    let prompt_is_response = prompt_source == "response";
+    let prompt_is_response =
+        transcript_completion.is_some() || parts[pane_line_field::PROMPT_SOURCE] == "response";
 
     // Sanitize prompt: replace pipes/newlines, filter system-injected messages, truncate
-    let prompt = sanitize_prompt(&parts[pane_line_field::PROMPT]);
+    let prompt = sanitize_prompt(
+        transcript_completion
+            .as_deref()
+            .unwrap_or(&parts[pane_line_field::PROMPT]),
+    );
 
     let session_id = if parts[pane_line_field::SESSION_ID].is_empty() {
         None
@@ -340,10 +364,12 @@ fn parse_pane_fields_with_processes(
 
     Some(PaneInfo {
         pane_active: parts[pane_line_field::PANE_ACTIVE] == "1",
-        status: if process_discovered {
+        status: if transcript_completion.is_some() {
+            PaneStatus::Idle
+        } else if process_discovered {
             PaneStatus::Idle
         } else {
-            PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS])
+            stored_status
         },
         attention: !parts[pane_line_field::PANE_ATTENTION].is_empty(),
         agent,
@@ -373,6 +399,86 @@ fn parse_pane_fields_with_processes(
             }
         },
     })
+}
+
+fn codex_completed_response(pane_id: &str, session_id: &str) -> Option<String> {
+    let cached = get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH);
+    let transcript = if cached.is_empty() {
+        let path = find_codex_session_transcript(session_id)?;
+        set_pane_option(pane_id, PANE_TRANSCRIPT_PATH, path.to_str()?);
+        path
+    } else {
+        PathBuf::from(cached)
+    };
+    let tail = read_file_tail(&transcript, 256 * 1024)?;
+    completed_response_from_jsonl(&tail)
+}
+
+fn find_codex_session_transcript(session_id: &str) -> Option<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    find_session_file(&codex_home.join("sessions"), session_id)
+}
+
+fn find_session_file(root: &Path, session_id: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_session_file(&path, session_id) {
+                return Some(found);
+            }
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).ok()?;
+    if start > 0 {
+        tail = tail.split_once('\n')?.1.to_string();
+    }
+    Some(tail)
+}
+
+fn completed_response_from_jsonl(transcript_tail: &str) -> Option<String> {
+    let events: Vec<serde_json::Value> = transcript_tail
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let last_started = events.iter().rposition(|value| {
+        value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started")
+    })?;
+    let last_completed = events.iter().rposition(|value| {
+        value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_complete")
+    })?;
+    if last_completed <= last_started {
+        return None;
+    }
+    events[last_started..last_completed]
+        .iter()
+        .rev()
+        .find_map(|value| {
+            let payload = value.get("payload")?;
+            if payload.get("type")?.as_str()? != "agent_message"
+                || payload.get("phase")?.as_str()? != "final_answer"
+            {
+                return None;
+            }
+            payload.get("message")?.as_str().map(str::to_string)
+        })
 }
 
 /// Discover hook-less agents during the gap between launching their TUI and
@@ -425,6 +531,7 @@ fn clear_agent_pane_state(pane_id: &str) {
         PANE_WORKTREE_NAME,
         PANE_WORKTREE_BRANCH,
         PANE_SESSION_ID,
+        PANE_TRANSCRIPT_PATH,
         PANE_PENDING_SESSION_END,
         PANE_PENDING_WORKTREE_REMOVE,
         PANE_STARTED_AT,
@@ -1156,6 +1263,74 @@ mod tests {
             test_mock::get(pane, PANE_PROMPT).as_deref(),
             Some("keep me"),
             "live Codex panes must not be swept just because tmux reports a shell"
+        );
+    }
+
+    #[test]
+    fn transcript_completion_requires_latest_turn_to_be_complete() {
+        let complete = r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        assert_eq!(
+            completed_response_from_jsonl(complete).as_deref(),
+            Some("done")
+        );
+
+        let running = format!(
+            "{complete}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}"
+        );
+        assert_eq!(completed_response_from_jsonl(&running), None);
+    }
+
+    #[test]
+    fn transcript_completion_ignores_commentary_and_uses_final_answer() {
+        let transcript = r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"working","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"final result","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        assert_eq!(
+            completed_response_from_jsonl(transcript).as_deref(),
+            Some("final result")
+        );
+    }
+
+    #[test]
+    fn codex_transcript_completion_updates_pane_without_stop_hook() {
+        let _guard = test_mock::install();
+        let pane = "%CODEX_NO_STOP";
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"recovered final","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .unwrap();
+        test_mock::set(
+            pane,
+            PANE_TRANSCRIPT_PATH,
+            transcript.path().to_str().unwrap(),
+        );
+
+        let mut fields = full_fields();
+        fields[pane_line_field::PANE_ID] = pane;
+        fields[pane_line_field::AGENT] = "codex";
+        fields[pane_line_field::PANE_STATUS] = "running";
+        fields[pane_line_field::PROMPT] = "original prompt";
+        fields[pane_line_field::PROMPT_SOURCE] = "user";
+        fields[pane_line_field::SESSION_ID] = "session-no-stop";
+
+        let info = parse_pane_line(&make_pane_line(&fields)).unwrap();
+        assert_eq!(info.status, PaneStatus::Idle);
+        assert_eq!(info.prompt, "recovered final");
+        assert!(info.prompt_is_response);
+        assert_eq!(
+            test_mock::get(pane, PANE_PROMPT).as_deref(),
+            Some("recovered final")
+        );
+        assert_eq!(
+            test_mock::get(pane, PANE_PROMPT_SOURCE).as_deref(),
+            Some("response")
         );
     }
 
