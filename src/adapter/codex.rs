@@ -21,7 +21,10 @@ impl CodexAdapter {
     pub const HOOK_REGISTRATIONS: &'static [HookRegistration] = &[
         HookRegistration {
             trigger: "SessionStart",
-            matcher: Some("startup|resume"),
+            // Codex applies this matcher to the SessionStart source, and an
+            // empty matcher does not catch lifecycle events. Include every
+            // source that starts or replaces a session in the current pane.
+            matcher: Some("startup|resume|clear|compact"),
             kind: AgentEventKind::SessionStart,
         },
         HookRegistration {

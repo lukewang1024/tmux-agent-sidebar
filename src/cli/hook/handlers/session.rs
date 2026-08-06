@@ -23,6 +23,12 @@ pub(in crate::cli::hook) fn on_session_start(
     set_notification_run_id(pane);
     tmux::unset_pane_option(pane, tmux::PANE_PROMPT);
     tmux::unset_pane_option(pane, tmux::PANE_PROMPT_SOURCE);
+    // The polling fallback caches the transcript path after resolving it from
+    // the session id. A /clear starts a new session in the same pane; keeping
+    // the old path here lets the next poll recover the previous session's
+    // completed response and immediately repopulate the prompt we just
+    // cleared.
+    tmux::unset_pane_option(pane, tmux::PANE_TRANSCRIPT_PATH);
     // `@pane_subagents` is deliberately preserved across SessionStart.
     // Subagents share the parent's `$TMUX_PANE`, so when a subagent
     // fires its own SessionStart after SubagentStart has populated the
@@ -40,6 +46,13 @@ pub(in crate::cli::hook) fn on_session_start(
     match source {
         "resume" => tmux::set_pane_option(pane, tmux::PANE_WAIT_REASON, "session_resumed"),
         "compact" => tmux::set_pane_option(pane, tmux::PANE_WAIT_REASON, "session_resumed_compact"),
+        "clear" => {
+            // The clear event can still carry the session id being replaced.
+            // If it remains on the pane, the polling fallback resolves that
+            // old transcript again and restores the response we cleared above.
+            tmux::unset_pane_option(pane, tmux::PANE_SESSION_ID);
+            tmux::unset_pane_option(pane, tmux::PANE_WAIT_REASON);
+        }
         _ => tmux::unset_pane_option(pane, tmux::PANE_WAIT_REASON),
     }
     set_status(pane, "idle");
@@ -177,6 +190,13 @@ mod tests {
     fn on_session_start_sets_agent_and_idle_status() {
         let _guard = tmux::test_mock::install();
         let pane = "%NEW_SESSION";
+        tmux::test_mock::set(pane, tmux::PANE_PROMPT, "stale response");
+        tmux::test_mock::set(pane, tmux::PANE_PROMPT_SOURCE, "response");
+        tmux::test_mock::set(
+            pane,
+            tmux::PANE_TRANSCRIPT_PATH,
+            "/tmp/previous-session.jsonl",
+        );
         let ctx = AgentContext {
             agent: "claude",
             cwd: "/repo",
@@ -202,6 +222,14 @@ mod tests {
         assert!(
             !tmux::test_mock::contains(pane, tmux::PANE_PROMPT),
             "SessionStart should clear any stale prompt"
+        );
+        assert!(
+            !tmux::test_mock::contains(pane, tmux::PANE_PROMPT_SOURCE),
+            "SessionStart should clear the stale prompt source"
+        );
+        assert!(
+            !tmux::test_mock::contains(pane, tmux::PANE_TRANSCRIPT_PATH),
+            "SessionStart should clear the previous session's transcript cache"
         );
     }
 
@@ -268,6 +296,35 @@ mod tests {
             tmux::test_mock::get(pane, tmux::PANE_WAIT_REASON).as_deref(),
             Some("session_resumed_compact"),
         );
+    }
+
+    #[test]
+    fn on_session_start_clear_drops_replaced_session_id() {
+        let _guard = tmux::test_mock::install();
+        let pane = "%CLEAR";
+        let ctx = AgentContext {
+            agent: "codex",
+            cwd: "/repo",
+            permission_mode: "default",
+            worktree: &None,
+            session_id: &Some("replaced-session".into()),
+        };
+        tmux::test_mock::set(pane, tmux::PANE_PROMPT, "old response");
+        tmux::test_mock::set(pane, tmux::PANE_TRANSCRIPT_PATH, "/tmp/old.jsonl");
+
+        on_session_start(pane, &ctx, "clear");
+
+        for key in &[
+            tmux::PANE_PROMPT,
+            tmux::PANE_PROMPT_SOURCE,
+            tmux::PANE_TRANSCRIPT_PATH,
+            tmux::PANE_SESSION_ID,
+        ] {
+            assert!(
+                !tmux::test_mock::contains(pane, key),
+                "clear must remove stale {key}"
+            );
+        }
     }
 
     #[test]
