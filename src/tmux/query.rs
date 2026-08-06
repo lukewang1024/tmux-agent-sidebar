@@ -275,14 +275,13 @@ fn parse_pane_fields_with_processes(
     let pane_id = &parts[pane_line_field::PANE_ID];
     let stored_status = PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]);
     let session_id_value = &parts[pane_line_field::SESSION_ID];
-    let transcript_completion = if agent == AgentType::Codex
-        && matches!(stored_status, PaneStatus::Running | PaneStatus::Waiting)
-        && !session_id_value.is_empty()
-    {
-        codex_completed_response(pane_id, session_id_value)
-    } else {
-        None
-    };
+    let has_cached_transcript = !get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH).is_empty();
+    let transcript_completion =
+        if agent == AgentType::Codex && (!session_id_value.is_empty() || has_cached_transcript) {
+            codex_completed_response(pane_id, session_id_value)
+        } else {
+            None
+        };
     if let Some(message) = transcript_completion.as_deref() {
         set_pane_option(pane_id, PANE_PROMPT, message);
         set_pane_option(pane_id, PANE_PROMPT_SOURCE, "response");
@@ -1332,6 +1331,36 @@ mod tests {
             test_mock::get(pane, PANE_PROMPT_SOURCE).as_deref(),
             Some("response")
         );
+    }
+
+    #[test]
+    fn discovered_codex_recovers_completion_from_cached_transcript_without_session_id() {
+        let _guard = test_mock::install();
+        let pane = "%CODEX_DISCOVERED_NO_SESSION";
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            transcript.path(),
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"cached final","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .unwrap();
+        test_mock::set(
+            pane,
+            PANE_TRANSCRIPT_PATH,
+            transcript.path().to_str().unwrap(),
+        );
+
+        let mut fields = full_fields();
+        fields[pane_line_field::PANE_ID] = pane;
+        fields[pane_line_field::AGENT] = "";
+        fields[pane_line_field::PANE_CURRENT_COMMAND] = "codex";
+
+        let info = parse_pane_line(&make_pane_line(&fields)).unwrap();
+        assert_eq!(info.agent, AgentType::Codex);
+        assert_eq!(info.status, PaneStatus::Idle);
+        assert_eq!(info.prompt, "cached final");
+        assert!(info.prompt_is_response);
     }
 
     #[test]
