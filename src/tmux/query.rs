@@ -282,7 +282,8 @@ fn parse_pane_fields_with_processes(
         } else {
             None
         };
-    if let Some(message) = transcript_completion.as_deref() {
+    let sanitized_completion = transcript_completion.as_deref().map(sanitize_prompt);
+    if let Some(message) = sanitized_completion.as_deref() {
         set_pane_option(pane_id, PANE_PROMPT, message);
         set_pane_option(pane_id, PANE_PROMPT_SOURCE, "response");
         set_pane_option(pane_id, PANE_STATUS, "idle");
@@ -349,11 +350,8 @@ fn parse_pane_fields_with_processes(
         transcript_completion.is_some() || parts[pane_line_field::PROMPT_SOURCE] == "response";
 
     // Sanitize prompt: replace pipes/newlines, filter system-injected messages, truncate
-    let prompt = sanitize_prompt(
-        transcript_completion
-            .as_deref()
-            .unwrap_or(&parts[pane_line_field::PROMPT]),
-    );
+    let prompt =
+        sanitized_completion.unwrap_or_else(|| sanitize_prompt(&parts[pane_line_field::PROMPT]));
 
     let session_id = if parts[pane_line_field::SESSION_ID].is_empty() {
         None
@@ -654,10 +652,11 @@ fn sanitize_prompt(raw: &str) -> String {
     {
         return String::new();
     }
-    if raw.chars().count() > 200 {
-        raw.chars().take(200).collect()
+    let single_line = raw.replace(['\r', '\n', '|'], " ");
+    if single_line.chars().count() > 200 {
+        single_line.chars().take(200).collect()
     } else {
-        raw.to_string()
+        single_line
     }
 }
 
@@ -1341,7 +1340,7 @@ mod tests {
         std::fs::write(
             transcript.path(),
             r#"{"type":"event_msg","payload":{"type":"task_started"}}
-{"type":"event_msg","payload":{"type":"agent_message","message":"cached final","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"cached final\nwith | details","phase":"final_answer"}}
 {"type":"event_msg","payload":{"type":"task_complete"}}"#,
         )
         .unwrap();
@@ -1359,8 +1358,12 @@ mod tests {
         let info = parse_pane_line(&make_pane_line(&fields)).unwrap();
         assert_eq!(info.agent, AgentType::Codex);
         assert_eq!(info.status, PaneStatus::Idle);
-        assert_eq!(info.prompt, "cached final");
+        assert_eq!(info.prompt, "cached final with   details");
         assert!(info.prompt_is_response);
+        assert_eq!(
+            test_mock::get(pane, PANE_PROMPT).as_deref(),
+            Some("cached final with   details")
+        );
     }
 
     #[test]
