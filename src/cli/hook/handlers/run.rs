@@ -59,7 +59,11 @@ pub(in crate::cli::hook) fn on_stop(
     } else {
         last_message
     };
-    if !visible_message.is_empty() {
+    // Codex/Traex responses are rendered directly from the transcript selected
+    // by session id. Keep the hook payload for notification text, but do not
+    // create a second pane-scoped message cache that can outlive its session.
+    let transcript_backed_response = matches!(ctx.agent, "codex" | "traex");
+    if !transcript_backed_response && !visible_message.is_empty() {
         let msg = sanitize_tmux_value(visible_message);
         tmux::set_pane_option(pane, tmux::PANE_PROMPT, &msg);
         tmux::set_pane_option(pane, tmux::PANE_PROMPT_SOURCE, "response");
@@ -408,6 +412,38 @@ mod tests {
             Some("idle")
         );
         assert!(!tmux::test_mock::contains(pane, tmux::PANE_STARTED_AT));
+    }
+
+    #[test]
+    fn codex_stop_does_not_cache_completed_response_in_pane() {
+        let _guard = tmux::test_mock::install();
+        let pane = "%CODEX_STOP";
+        let ctx = AgentContext {
+            agent: "codex",
+            cwd: "/repo",
+            permission_mode: "default",
+            worktree: &None,
+            session_id: &Some("session-123".into()),
+        };
+
+        on_stop(
+            pane,
+            &ctx,
+            "completed response",
+            "",
+            None,
+            &desktop_notification::DesktopNotificationSettings {
+                enabled: false,
+                events: Default::default(),
+            },
+        );
+
+        assert!(!tmux::test_mock::contains(pane, tmux::PANE_PROMPT));
+        assert!(!tmux::test_mock::contains(pane, tmux::PANE_PROMPT_SOURCE));
+        assert_eq!(
+            tmux::test_mock::get(pane, tmux::PANE_SESSION_ID).as_deref(),
+            Some("session-123")
+        );
     }
 
     #[test]

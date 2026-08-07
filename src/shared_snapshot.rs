@@ -24,10 +24,16 @@ use crate::state::AppState;
 use crate::tmux::{self, SessionInfo};
 
 const PROTOCOL_VERSION: u8 = 2;
+/// Bump when daemon cache semantics change without a wire-format change.
+const DAEMON_CACHE_REVISION: u8 = 1;
 const REQUEST_SNAPSHOT: u8 = 1;
 const REQUEST_INVALIDATE: u8 = 2;
-const TMUX_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+// Codex has no reliable lifecycle hooks before its first prompt or when its
+// TUI exits. Keep these aligned with the visible sidebar's foreground refresh
+// cadence so process-only session starts/stops cannot sit in the shared cache
+// for tens of seconds.
+const TMUX_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -199,9 +205,13 @@ fn server_key() -> u64 {
     let mut hasher = DefaultHasher::new();
     unsafe { libc::geteuid() }.hash(&mut hasher);
     // A newly installed binary must not remain attached to a daemon running
-    // an older wire/schema implementation. The old daemon becomes idle and
-    // exits while the new version gets its own socket.
+    // an older wire/schema or cache implementation. Include the protocol in
+    // the socket identity because local rebuilds can change daemon behavior
+    // without changing the package version. The old daemon becomes idle and
+    // exits while the new binary gets its own socket.
     crate::VERSION.hash(&mut hasher);
+    PROTOCOL_VERSION.hash(&mut hasher);
+    DAEMON_CACHE_REVISION.hash(&mut hasher);
     std::env::var("TMUX")
         .unwrap_or_default()
         .split(',')
@@ -403,5 +413,11 @@ mod tests {
                 .to_string_lossy()
                 .contains("sidebar")
         );
+    }
+
+    #[test]
+    fn process_lifecycle_cache_matches_foreground_refresh_cadence() {
+        assert_eq!(TMUX_FALLBACK_REFRESH_INTERVAL, Duration::from_secs(2));
+        assert_eq!(PROCESS_REFRESH_INTERVAL, Duration::from_secs(2));
     }
 }

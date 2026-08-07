@@ -313,22 +313,17 @@ fn parse_pane_fields_with_processes(
     let pane_id = &parts[pane_line_field::PANE_ID];
     let stored_status = PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]);
     let session_id_value = &parts[pane_line_field::SESSION_ID];
-    let has_cached_transcript = !get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH).is_empty();
-    let transcript_completion = if matches!(agent, AgentType::Codex | AgentType::Traex)
-        && (!session_id_value.is_empty() || has_cached_transcript)
-    {
+    let session_bound_message = matches!(agent, AgentType::Codex | AgentType::Traex);
+    let awaiting_session_id = session_bound_message && session_id_value.is_empty();
+    // Completed Codex/Traex messages come from the transcript selected by the
+    // current session id. `@pane_prompt` remains useful for a live submitted
+    // user prompt, but is never the source of truth for a completed response.
+    let transcript_completion = if session_bound_message && !session_id_value.is_empty() {
         codex_completed_response(pane_id, session_id_value)
     } else {
         None
     };
     let sanitized_completion = transcript_completion.as_deref().map(sanitize_prompt);
-    if let Some(message) = sanitized_completion.as_deref() {
-        set_pane_option(pane_id, PANE_PROMPT, message);
-        set_pane_option(pane_id, PANE_PROMPT_SOURCE, "response");
-        set_pane_option(pane_id, PANE_STATUS, "idle");
-        unset_pane_option(pane_id, PANE_STARTED_AT);
-        unset_pane_option(pane_id, PANE_WAIT_REASON);
-    }
 
     // Codex / OpenCode panes can leave stale tmux metadata behind after the
     // agent exits and the pane falls back to the user's shell. Neither
@@ -354,15 +349,11 @@ fn parse_pane_fields_with_processes(
                     .parse::<u64>()
                     .ok();
                 if process_miss_exceeded_grace(missing_since, now) {
-                    // Codex can transiently disappear from the pane's process
-                    // tree while its TUI remains alive between turns. Hide the
-                    // item for this snapshot, but retain its final response and
-                    // session metadata. A real next SessionStart clears stale
-                    // state before accepting another prompt. OpenCode lacks the
-                    // same reliable lifecycle reset, so it keeps eager cleanup.
-                    if agent == AgentType::OpenCode {
-                        clear_agent_pane_state(pane_id);
-                    }
+                    // Once the process is confirmed gone, its session binding
+                    // and path locator are no longer useful. A later launch is
+                    // rediscovered from the new process and waits for its own
+                    // session id instead of inheriting pane-scoped residue.
+                    clear_agent_pane_state(pane_id);
                     return None;
                 }
                 if missing_since.is_none() {
@@ -388,24 +379,36 @@ fn parse_pane_fields_with_processes(
         PermissionMode::Default
     };
 
-    let prompt_is_response =
-        transcript_completion.is_some() || parts[pane_line_field::PROMPT_SOURCE] == "response";
+    let prompt_is_response = if session_bound_message {
+        transcript_completion.is_some()
+    } else {
+        parts[pane_line_field::PROMPT_SOURCE] == "response"
+    };
 
     // Sanitize prompt: replace pipes/newlines, filter system-injected messages, truncate
-    let prompt =
-        sanitized_completion.unwrap_or_else(|| sanitize_prompt(&parts[pane_line_field::PROMPT]));
+    let prompt = if awaiting_session_id {
+        String::new()
+    } else if session_bound_message {
+        sanitized_completion.unwrap_or_else(|| {
+            if parts[pane_line_field::PROMPT_SOURCE] == "response" {
+                String::new()
+            } else {
+                sanitize_prompt(&parts[pane_line_field::PROMPT])
+            }
+        })
+    } else {
+        sanitize_prompt(&parts[pane_line_field::PROMPT])
+    };
 
-    let session_id = if parts[pane_line_field::SESSION_ID].is_empty() {
+    let session_id = if session_id_value.is_empty() {
         None
     } else {
-        Some(parts[pane_line_field::SESSION_ID].to_string())
+        Some(session_id_value.to_string())
     };
 
     Some(PaneInfo {
         pane_active: parts[pane_line_field::PANE_ACTIVE] == "1",
-        status: if transcript_completion.is_some() {
-            PaneStatus::Idle
-        } else if process_discovered {
+        status: if awaiting_session_id || transcript_completion.is_some() || process_discovered {
             PaneStatus::Idle
         } else {
             stored_status
@@ -417,8 +420,16 @@ fn parse_pane_fields_with_processes(
         pane_id: parts[pane_line_field::PANE_ID].to_string(),
         prompt,
         prompt_is_response,
-        started_at: parts[pane_line_field::STARTED_AT].parse().ok(),
-        wait_reason: parts[pane_line_field::WAIT_REASON].to_string(),
+        started_at: if transcript_completion.is_some() {
+            None
+        } else {
+            parts[pane_line_field::STARTED_AT].parse().ok()
+        },
+        wait_reason: if transcript_completion.is_some() {
+            String::new()
+        } else {
+            parts[pane_line_field::WAIT_REASON].to_string()
+        },
         permission_mode,
         subagents: parse_subagents(&parts[pane_line_field::SUBAGENTS]),
         pane_pid,
@@ -442,15 +453,24 @@ fn parse_pane_fields_with_processes(
 
 fn codex_completed_response(pane_id: &str, session_id: &str) -> Option<String> {
     let cached = get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH);
-    let transcript = if cached.is_empty() {
+    let transcript = if cached_transcript_matches_session(&cached, session_id) {
+        PathBuf::from(cached)
+    } else {
         let path = find_codex_session_transcript(session_id)?;
         set_pane_option(pane_id, PANE_TRANSCRIPT_PATH, path.to_str()?);
         path
-    } else {
-        PathBuf::from(cached)
     };
     let tail = read_file_tail(&transcript, 256 * 1024)?;
     completed_response_from_jsonl(&tail)
+}
+
+fn cached_transcript_matches_session(cached: &str, session_id: &str) -> bool {
+    !cached.is_empty()
+        && !session_id.is_empty()
+        && Path::new(cached)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(session_id))
 }
 
 fn find_codex_session_transcript(session_id: &str) -> Option<PathBuf> {
@@ -509,15 +529,29 @@ fn completed_response_from_jsonl(transcript_tail: &str) -> Option<String> {
     events[last_started..last_completed]
         .iter()
         .rev()
-        .find_map(|value| {
-            let payload = value.get("payload")?;
-            if payload.get("type")?.as_str()? != "agent_message"
-                || payload.get("phase")?.as_str()? != "final_answer"
-            {
-                return None;
-            }
-            payload.get("message")?.as_str().map(str::to_string)
-        })
+        .find_map(completed_response_message)
+}
+
+fn completed_response_message(value: &serde_json::Value) -> Option<String> {
+    let payload = value.get("payload")?;
+    if payload.get("phase")?.as_str()? != "final_answer" {
+        return None;
+    }
+
+    match (value.get("type")?.as_str()?, payload.get("type")?.as_str()?) {
+        ("event_msg", "agent_message") => payload.get("message")?.as_str().map(str::to_string),
+        ("response_item", "message") if payload.get("role")?.as_str()? == "assistant" => {
+            let text: String = payload
+                .get("content")?
+                .as_array()?
+                .iter()
+                .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("output_text"))
+                .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+                .collect();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 /// Discover hook-less agents during the gap between launching their TUI and
@@ -1296,12 +1330,14 @@ mod tests {
         let pane = "%CODEX_LIVE";
         test_mock::set(pane, PANE_AGENT, "codex");
         test_mock::set(pane, PANE_PROMPT, "keep me");
+        test_mock::set(pane, PANE_SESSION_ID, "live-session");
 
         let mut fields = full_fields();
         fields[pane_line_field::PANE_ID] = pane;
         fields[pane_line_field::AGENT] = "codex";
         fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
         fields[pane_line_field::PANE_PID] = "200";
+        fields[pane_line_field::SESSION_ID] = "live-session";
         let fields = field_strings(&fields);
         let snapshot = process_snapshot(
             "200 1 zsh zsh -c codex\n201 200 codex /opt/homebrew/bin/codex --full-auto\n",
@@ -1348,22 +1384,32 @@ mod tests {
     }
 
     #[test]
+    fn transcript_completion_reads_codex_response_item_final_answer() {
+        let transcript = r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"final "},{"type":"output_text","text":"result"}]}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+
+        assert_eq!(
+            completed_response_from_jsonl(transcript).as_deref(),
+            Some("final result")
+        );
+    }
+
+    #[test]
     fn codex_transcript_completion_updates_pane_without_stop_hook() {
         let _guard = test_mock::install();
         let pane = "%CODEX_NO_STOP";
-        let transcript = tempfile::NamedTempFile::new().unwrap();
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript = transcript_dir.path().join("rollout-session-no-stop.jsonl");
         std::fs::write(
-            transcript.path(),
+            &transcript,
             r#"{"type":"event_msg","payload":{"type":"task_started"}}
 {"type":"event_msg","payload":{"type":"agent_message","message":"recovered final","phase":"final_answer"}}
 {"type":"event_msg","payload":{"type":"task_complete"}}"#,
         )
         .unwrap();
-        test_mock::set(
-            pane,
-            PANE_TRANSCRIPT_PATH,
-            transcript.path().to_str().unwrap(),
-        );
+        test_mock::set(pane, PANE_TRANSCRIPT_PATH, transcript.to_str().unwrap());
 
         let mut fields = full_fields();
         fields[pane_line_field::PANE_ID] = pane;
@@ -1377,18 +1423,18 @@ mod tests {
         assert_eq!(info.status, PaneStatus::Idle);
         assert_eq!(info.prompt, "recovered final");
         assert!(info.prompt_is_response);
-        assert_eq!(
-            test_mock::get(pane, PANE_PROMPT).as_deref(),
-            Some("recovered final")
+        assert!(
+            !test_mock::contains(pane, PANE_PROMPT),
+            "completed responses must not be copied into pane state"
         );
-        assert_eq!(
-            test_mock::get(pane, PANE_PROMPT_SOURCE).as_deref(),
-            Some("response")
+        assert!(
+            !test_mock::contains(pane, PANE_PROMPT_SOURCE),
+            "the transcript remains the response source of truth"
         );
     }
 
     #[test]
-    fn discovered_codex_recovers_completion_from_cached_transcript_without_session_id() {
+    fn discovered_codex_without_session_id_ignores_cached_message() {
         let _guard = test_mock::install();
         let pane = "%CODEX_DISCOVERED_NO_SESSION";
         let transcript = tempfile::NamedTempFile::new().unwrap();
@@ -1413,11 +1459,14 @@ mod tests {
         let info = parse_pane_line(&make_pane_line(&fields)).unwrap();
         assert_eq!(info.agent, AgentType::Codex);
         assert_eq!(info.status, PaneStatus::Idle);
-        assert_eq!(info.prompt, "cached final with   details");
-        assert!(info.prompt_is_response);
-        assert_eq!(
-            test_mock::get(pane, PANE_PROMPT).as_deref(),
-            Some("cached final with   details")
+        assert_eq!(info.prompt, "");
+        assert!(!info.prompt_is_response);
+        assert!(info.session_id.is_none());
+        assert!(!test_mock::contains(pane, PANE_PROMPT));
+        assert!(!test_mock::contains(pane, PANE_PROMPT_SOURCE));
+        assert!(
+            test_mock::contains(pane, PANE_TRANSCRIPT_PATH),
+            "an unselected locator may remain cached but must not affect rendering"
         );
     }
 
@@ -1428,6 +1477,16 @@ mod tests {
         test_mock::set(pane, PANE_AGENT, "codex");
         test_mock::set(pane, PANE_PROMPT, "last completed result");
         test_mock::set(pane, PANE_PROMPT_SOURCE, "response");
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript = transcript_dir.path().join("rollout-live-session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"last completed result","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .unwrap();
+        test_mock::set(pane, PANE_TRANSCRIPT_PATH, transcript.to_str().unwrap());
 
         let mut fields = full_fields();
         fields[pane_line_field::PANE_ID] = pane;
@@ -1436,6 +1495,7 @@ mod tests {
         fields[pane_line_field::PANE_PID] = "200";
         fields[pane_line_field::PROMPT] = "last completed result";
         fields[pane_line_field::PROMPT_SOURCE] = "response";
+        fields[pane_line_field::SESSION_ID] = "live-session";
         let fields = field_strings(&fields);
         let snapshot = process_snapshot("200 1 zsh zsh\n");
 
@@ -1449,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_process_exit_hides_item_but_preserves_last_result() {
+    fn codex_process_exit_clears_session_binding_and_cache() {
         let _guard = test_mock::install();
         let pane = "%CODEX_STALE";
         test_mock::set(pane, PANE_AGENT, "codex");
@@ -1459,6 +1519,7 @@ mod tests {
         test_mock::set(pane, PANE_STARTED_AT, "1700000000");
         test_mock::set(pane, PANE_CWD, "/repo/codex");
         test_mock::set(pane, PANE_WAIT_REASON, "permission");
+        test_mock::set(pane, PANE_SESSION_ID, "completed-session");
         test_mock::set(
             pane,
             PANE_AGENT_MISSING_SINCE,
@@ -1472,6 +1533,7 @@ mod tests {
         fields[pane_line_field::PANE_ID] = pane;
         fields[pane_line_field::AGENT] = "codex";
         fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
+        fields[pane_line_field::SESSION_ID] = "completed-session";
         let fields = field_strings(&fields);
         let snapshot = process_snapshot("999 1 zsh zsh\n");
 
@@ -1484,12 +1546,14 @@ mod tests {
             PANE_STARTED_AT,
             PANE_CWD,
             PANE_WAIT_REASON,
+            PANE_SESSION_ID,
+            PANE_TRANSCRIPT_PATH,
         ] {
-            assert!(test_mock::contains(pane, key), "{key} must be retained");
+            assert!(!test_mock::contains(pane, key), "{key} must be cleared");
         }
         assert!(
-            log.exists(),
-            "Codex activity must survive a process-tree miss until SessionStart resets it"
+            !log.exists(),
+            "Codex activity belongs to the exited session and must be removed"
         );
     }
 

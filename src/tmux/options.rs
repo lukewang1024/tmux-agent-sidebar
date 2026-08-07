@@ -63,7 +63,9 @@ pub const PANE_ROLE: &str = "@pane_role";
 /// Agent-provided session id, surfaced in the status line for
 /// quick reference.
 pub const PANE_SESSION_ID: &str = "@pane_session_id";
-/// Cached Codex transcript path used when a turn completes without a Stop hook.
+/// Cached Codex transcript locator. It is only valid when its filename contains
+/// the pane's current session id; completed message text is read from that file
+/// and is never cached in a pane option.
 pub const PANE_TRANSCRIPT_PATH: &str = "@pane_transcript_path";
 /// Epoch-seconds timestamp of the current run's start — drives
 /// the "running for Xs" label.

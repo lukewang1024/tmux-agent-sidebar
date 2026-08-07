@@ -26,8 +26,7 @@ pub(in crate::cli::hook) fn on_session_start(
     // The polling fallback caches the transcript path after resolving it from
     // the session id. A /clear starts a new session in the same pane; keeping
     // the old path here lets the next poll recover the previous session's
-    // completed response and immediately repopulate the prompt we just
-    // cleared.
+    // completed response for the wrong session.
     tmux::unset_pane_option(pane, tmux::PANE_TRANSCRIPT_PATH);
     // `@pane_subagents` is deliberately preserved across SessionStart.
     // Subagents share the parent's `$TMUX_PANE`, so when a subagent

@@ -34,8 +34,21 @@ pub(crate) fn cmd_hook(args: &[String]) -> i32 {
         return 0;
     };
 
+    let should_notify = !matches!(
+        &event,
+        AgentEvent::ActivityLog { .. }
+            | AgentEvent::TaskCreated { .. }
+            | AgentEvent::WorktreeCreate
+    );
     let code = handle_event(&pane, agent_name, event);
     crate::shared_snapshot::invalidate();
+    // Hook writes happen in a short-lived helper process, while every sidebar
+    // TUI has its own event loop. Wake those loops after invalidating the
+    // shared snapshot so lifecycle/status changes do not wait for the normal
+    // 2s foreground (or 60s background) refresh interval.
+    if should_notify {
+        crate::tmux::notify_other_sidebars();
+    }
     code
 }
 
