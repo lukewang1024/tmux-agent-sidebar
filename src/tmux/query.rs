@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::process::{ProcessSnapshot, command_basename};
+use crate::process::{ProcessSnapshot, command_basename, process_matches_agent};
 
 use super::commands::run_tmux;
 use super::options::{
@@ -224,7 +224,7 @@ fn build_session_hierarchy(
             });
 
         if let Some(pane) = parse_pane_fields_with_processes(pane_fields, process_snapshot) {
-            if pane.agent == AgentType::Codex
+            if matches!(pane.agent, AgentType::Codex | AgentType::Traex)
                 && let Some(pid) = pane.pane_pid
             {
                 codex_pids.push((window_id.to_string(), window.panes.len(), pid));
@@ -314,12 +314,13 @@ fn parse_pane_fields_with_processes(
     let stored_status = PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]);
     let session_id_value = &parts[pane_line_field::SESSION_ID];
     let has_cached_transcript = !get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH).is_empty();
-    let transcript_completion =
-        if agent == AgentType::Codex && (!session_id_value.is_empty() || has_cached_transcript) {
-            codex_completed_response(pane_id, session_id_value)
-        } else {
-            None
-        };
+    let transcript_completion = if matches!(agent, AgentType::Codex | AgentType::Traex)
+        && (!session_id_value.is_empty() || has_cached_transcript)
+    {
+        codex_completed_response(pane_id, session_id_value)
+    } else {
+        None
+    };
     let sanitized_completion = transcript_completion.as_deref().map(sanitize_prompt);
     if let Some(message) = sanitized_completion.as_deref() {
         set_pane_option(pane_id, PANE_PROMPT, message);
@@ -338,7 +339,10 @@ fn parse_pane_fields_with_processes(
     // is gone. Subsequent polls short-circuit at the `AgentType::from_label`
     // check above once `@pane_agent` has been cleared. Claude is excluded
     // because its SessionEnd hook drives cleanup instead.
-    if matches!(agent, AgentType::Codex | AgentType::OpenCode) && is_shell_command(current_command)
+    if matches!(
+        agent,
+        AgentType::Codex | AgentType::Traex | AgentType::OpenCode
+    ) && is_shell_command(current_command)
     {
         let pane_id = &parts[pane_line_field::PANE_ID];
         if let (Some(pid), Some(snapshot)) = (pane_pid, process_snapshot) {
@@ -535,13 +539,14 @@ fn discover_process_agent(
 
     match command {
         CODEX_AGENT => return Some(AgentType::Codex),
+        "traex" | "traecli" => return Some(AgentType::Traex),
         "opencode" => return Some(AgentType::OpenCode),
         _ => {}
     }
 
     let pid = pane_pid?;
     let snapshot = process_snapshot?;
-    [AgentType::Codex, AgentType::OpenCode]
+    [AgentType::Codex, AgentType::Traex, AgentType::OpenCode]
         .into_iter()
         .find(|agent| snapshot.tree_has_agent(&[pid], agent))
 }
@@ -640,8 +645,12 @@ fn pane_output_needs_process_snapshot(all_panes_output: &str) -> bool {
             return false;
         }
         let pane_fields = &parts[session_line_field::PANE_LINE_OFFSET..];
-        AgentType::from_label(&pane_fields[pane_line_field::AGENT])
-            .is_some_and(|agent| matches!(agent, AgentType::Codex | AgentType::OpenCode))
+        AgentType::from_label(&pane_fields[pane_line_field::AGENT]).is_some_and(|agent| {
+            matches!(
+                agent,
+                AgentType::Codex | AgentType::Traex | AgentType::OpenCode
+            )
+        })
     })
 }
 
@@ -651,12 +660,15 @@ fn apply_codex_permission_modes(
     process_snapshot: &ProcessSnapshot,
 ) {
     for (idx, pid) in pids_to_check {
+        let Some(agent_name) = panes.get(*idx).map(|pane| pane.agent.as_str()) else {
+            continue;
+        };
         let descendants = process_snapshot.descendants(&[*pid]);
         for descendant in descendants {
             let Some(info) = process_snapshot.info_by_pid.get(&descendant) else {
                 continue;
             };
-            if command_basename(&info.comm) != CODEX_AGENT {
+            if !process_matches_agent(info, agent_name) {
                 continue;
             }
             if let Some(pane) = panes.get_mut(*idx) {
@@ -856,6 +868,18 @@ mod tests {
 
         assert!(snapshot.tree_has_agent(&[100], &AgentType::OpenCode));
         assert!(!snapshot.tree_has_agent(&[100], &AgentType::Codex));
+    }
+
+    #[test]
+    fn discovers_traex_from_public_and_internal_commands() {
+        assert_eq!(
+            discover_process_agent("traex", None, None),
+            Some(AgentType::Traex)
+        );
+        assert_eq!(
+            discover_process_agent("traecli", None, None),
+            Some(AgentType::Traex)
+        );
     }
 
     // ─── sanitize_prompt tests ──────────────────────────────────────

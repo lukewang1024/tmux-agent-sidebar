@@ -45,7 +45,7 @@ pub(crate) use query::{
 };
 pub use types::{
     AgentType, CLAUDE_AGENT, CODEX_AGENT, OPENCODE_AGENT, PaneInfo, PaneStatus, PermissionMode,
-    SessionInfo, WindowInfo, WorktreeMetadata,
+    SessionInfo, TRAEX_AGENT, WindowInfo, WorktreeMetadata,
 };
 
 #[cfg(test)]

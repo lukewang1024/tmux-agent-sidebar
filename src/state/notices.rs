@@ -132,6 +132,7 @@ impl AppState {
                 vec![
                     crate::tmux::CLAUDE_AGENT.to_string(),
                     crate::tmux::CODEX_AGENT.to_string(),
+                    crate::tmux::TRAEX_AGENT.to_string(),
                 ],
                 &resolved_hook.path,
                 load_config,

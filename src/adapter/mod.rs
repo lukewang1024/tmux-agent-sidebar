@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod opencode;
+pub mod traex;
 
 use crate::event::AgentEventKind;
 

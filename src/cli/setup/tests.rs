@@ -460,13 +460,13 @@ fn full_output_has_expected_top_level_keys() {
     let agents = v.get("agents").and_then(Value::as_object).unwrap();
     let mut keys: Vec<&str> = agents.keys().map(String::as_str).collect();
     keys.sort();
-    assert_eq!(keys, vec!["claude", "codex"]);
+    assert_eq!(keys, vec!["claude", "codex", "traex"]);
 }
 
 #[test]
 fn full_output_snippet_matches_single_agent_snippet() {
     let full = build_setup_output(FAKE_HOOK);
-    for agent in ["claude", "codex"] {
+    for agent in ["claude", "codex", "traex"] {
         let from_full = full
             .pointer(&format!("/agents/{}/snippet", agent))
             .unwrap_or_else(|| panic!("missing snippet for {}", agent));
@@ -481,6 +481,7 @@ fn full_output_normalized_hooks_count_matches_table() {
     for (agent, table_len) in [
         ("claude", ClaudeAdapter::HOOK_REGISTRATIONS.len()),
         ("codex", CodexAdapter::HOOK_REGISTRATIONS.len()),
+        ("traex", TraexAdapter::HOOK_REGISTRATIONS.len()),
     ] {
         let hooks = full
             .pointer(&format!("/agents/{}/hooks", agent))
@@ -573,7 +574,8 @@ fn run_setup_too_many_args_returns_err_exit_2() {
 
 #[test]
 fn full_output_snapshot() {
-    let v = build_setup_output(FAKE_HOOK);
+    let mut v = build_setup_output(FAKE_HOOK);
+    v["agents"].as_object_mut().unwrap().remove("traex");
     let actual = serde_json::to_string_pretty(&v).unwrap();
     // Version-independent snapshot: substitute the placeholder at test
     // time so a version bump in Cargo.toml does not break this test.
@@ -921,7 +923,7 @@ const EXPECTED_FULL_OUTPUT: &str = r#"{
 #[test]
 fn full_output_normalized_command_matches_snippet_command() {
     let full = build_setup_output(FAKE_HOOK);
-    for agent in ["claude", "codex"] {
+    for agent in ["claude", "codex", "traex"] {
         let hooks = full
             .pointer(&format!("/agents/{}/hooks", agent))
             .and_then(Value::as_array)

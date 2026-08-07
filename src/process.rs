@@ -121,14 +121,16 @@ pub(crate) fn command_basename(command: &str) -> &str {
 }
 
 pub(crate) fn process_matches_agent(info: &ProcessInfo, agent_name: &str) -> bool {
-    if command_basename(&info.comm) == agent_name {
+    let matches_name =
+        |name: &str| name == agent_name || (agent_name == "traex" && name == "traecli");
+    if matches_name(command_basename(&info.comm)) {
         return true;
     }
 
     let Some(command) = info.args.split_whitespace().next() else {
         return false;
     };
-    command_basename(command.trim_matches('"')) == agent_name
+    matches_name(command_basename(command.trim_matches('"')))
 }
 
 #[cfg(test)]
@@ -194,5 +196,18 @@ mod tests {
             },
             "opencode",
         ));
+    }
+
+    #[test]
+    fn traex_matches_public_and_internal_binary_names() {
+        for name in ["traex", "traecli"] {
+            assert!(process_matches_agent(
+                &ProcessInfo {
+                    comm: name.into(),
+                    args: name.into()
+                },
+                "traex",
+            ));
+        }
     }
 }

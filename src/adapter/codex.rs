@@ -47,52 +47,60 @@ impl CodexAdapter {
 
 impl EventAdapter for CodexAdapter {
     fn parse(&self, event_name: &str, input: &Value) -> Option<AgentEvent> {
-        match event_name {
-            "session-start" => Some(AgentEvent::SessionStart {
-                agent: CODEX_AGENT.into(),
-                cwd: json_str(input, "cwd").into(),
-                permission_mode: json_str(input, "permission_mode").into(),
-                source: json_str(input, "source").into(),
-                worktree: None,
-                agent_id: None,
-                session_id: optional_str(input, "session_id"),
-            }),
-            "user-prompt-submit" => Some(AgentEvent::UserPromptSubmit {
-                agent: CODEX_AGENT.into(),
-                cwd: json_str(input, "cwd").into(),
-                permission_mode: json_str(input, "permission_mode").into(),
-                prompt: json_str(input, "prompt").into(),
-                worktree: None,
-                agent_id: None,
-                session_id: optional_str(input, "session_id"),
-            }),
-            "stop" => Some(AgentEvent::Stop {
-                agent: CODEX_AGENT.into(),
-                cwd: json_str(input, "cwd").into(),
-                permission_mode: json_str(input, "permission_mode").into(),
-                last_message: json_str(input, "last_assistant_message").into(),
-                transcript_path: json_str(input, "transcript_path").into(),
-                response: Some("{\"continue\":true}".into()),
-                worktree: None,
-                agent_id: None,
-                session_id: optional_str(input, "session_id"),
-            }),
-            // Codex's PostToolUse currently fires only for Bash (tool_input is
-            // typed `{ command: String }`). Other tools do not emit the hook,
-            // so the resulting activity log is Bash-only.
-            "activity-log" => {
-                let tool_name = json_str(input, "tool_name");
-                if tool_name.is_empty() {
-                    return None;
-                }
-                Some(AgentEvent::ActivityLog {
-                    tool_name: tool_name.into(),
-                    tool_input: json_value_or_null(input, "tool_input"),
-                    tool_response: json_value_or_null(input, "tool_response"),
-                })
+        parse_codex_event(CODEX_AGENT, event_name, input)
+    }
+}
+
+pub(crate) fn parse_codex_event(
+    agent_name: &str,
+    event_name: &str,
+    input: &Value,
+) -> Option<AgentEvent> {
+    match event_name {
+        "session-start" => Some(AgentEvent::SessionStart {
+            agent: agent_name.into(),
+            cwd: json_str(input, "cwd").into(),
+            permission_mode: json_str(input, "permission_mode").into(),
+            source: json_str(input, "source").into(),
+            worktree: None,
+            agent_id: None,
+            session_id: optional_str(input, "session_id"),
+        }),
+        "user-prompt-submit" => Some(AgentEvent::UserPromptSubmit {
+            agent: agent_name.into(),
+            cwd: json_str(input, "cwd").into(),
+            permission_mode: json_str(input, "permission_mode").into(),
+            prompt: json_str(input, "prompt").into(),
+            worktree: None,
+            agent_id: None,
+            session_id: optional_str(input, "session_id"),
+        }),
+        "stop" => Some(AgentEvent::Stop {
+            agent: agent_name.into(),
+            cwd: json_str(input, "cwd").into(),
+            permission_mode: json_str(input, "permission_mode").into(),
+            last_message: json_str(input, "last_assistant_message").into(),
+            transcript_path: json_str(input, "transcript_path").into(),
+            response: Some("{\"continue\":true}".into()),
+            worktree: None,
+            agent_id: None,
+            session_id: optional_str(input, "session_id"),
+        }),
+        // Codex's PostToolUse currently fires only for Bash (tool_input is
+        // typed `{ command: String }`). Other tools do not emit the hook,
+        // so the resulting activity log is Bash-only.
+        "activity-log" => {
+            let tool_name = json_str(input, "tool_name");
+            if tool_name.is_empty() {
+                return None;
             }
-            _ => None,
+            Some(AgentEvent::ActivityLog {
+                tool_name: tool_name.into(),
+                tool_input: json_value_or_null(input, "tool_input"),
+                tool_response: json_value_or_null(input, "tool_response"),
+            })
         }
+        _ => None,
     }
 }
 

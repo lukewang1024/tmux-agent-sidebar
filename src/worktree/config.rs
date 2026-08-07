@@ -7,7 +7,7 @@ pub const AGENT_OPTION: &str = "@agent-sidebar-default-agent";
 pub const BRANCH_PREFIX_OPTION: &str = "@agent-sidebar-branch-prefix";
 pub const WORKTREE_DIR_OPTION: &str = "@agent-sidebar-worktree-dir";
 
-pub const AGENTS: &[&str] = &["claude", "codex", "opencode"];
+pub const AGENTS: &[&str] = &["claude", "codex", "opencode", "traex"];
 pub const CLAUDE_MODES: &[&str] = &[
     "default",
     "plan",
@@ -20,7 +20,7 @@ pub const OPENCODE_MODES: &[&str] = &["default"];
 
 pub fn modes_for(agent: &str) -> &'static [&'static str] {
     match agent {
-        "codex" => CODEX_MODES,
+        "codex" | "traex" => CODEX_MODES,
         "opencode" => OPENCODE_MODES,
         _ => CLAUDE_MODES,
     }
@@ -43,6 +43,9 @@ pub fn agent_command(agent: &str, mode: &str) -> String {
         ("codex", "auto") => "codex --full-auto".into(),
         ("codex", "bypassPermissions") => "codex --dangerously-bypass-approvals-and-sandbox".into(),
         ("codex", _) => "codex".into(),
+        ("traex", "auto") => "traex --full-auto".into(),
+        ("traex", "bypassPermissions") => "traex --dangerously-bypass-approvals-and-sandbox".into(),
+        ("traex", _) => "traex".into(),
         ("opencode", _) => "opencode".into(),
         (a, _) => a.to_string(),
     }
