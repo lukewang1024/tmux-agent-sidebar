@@ -5,7 +5,7 @@ use serde_json::Value;
 
 pub const LOCAL_VERSION: &str = crate::VERSION;
 const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/hiroppy/tmux-agent-sidebar/releases/latest";
+    "https://api.github.com/repos/lukewang1024/tmux-agent-sidebar/releases/latest";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateNotice {

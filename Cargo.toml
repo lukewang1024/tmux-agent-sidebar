@@ -1,10 +1,10 @@
 [package]
 name = "tmux-agent-sidebar"
-version = "0.13.0"
+version = "0.13.0-downstream.1"
 edition = "2024"
 license = "MIT"
 description = "A tmux sidebar that monitors AI coding agents across all windows and sessions in real-time"
-repository = "https://github.com/hiroppy/tmux-agent-sidebar"
+repository = "https://github.com/lukewang1024/tmux-agent-sidebar"
 
 [features]
 # Force-display notices (version, missing hooks, claude plugin) even when
