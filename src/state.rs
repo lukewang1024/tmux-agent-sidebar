@@ -27,6 +27,7 @@ pub(crate) use notices::debug_forced_display;
 pub use notices::{ClaudePluginNotice, NoticesCopyTarget, NoticesMissingHookGroup, NoticesState};
 pub use pane_runtime::{PaneRuntimeMap, PaneRuntimeState};
 pub use popup::{PopupState, SpawnField};
+pub(crate) use refresh::sweep_dead_bg_shells;
 #[cfg(test)]
 pub(crate) use refresh::{TaskProgressDecision, classify_task_progress};
 pub use scroll::{ScrollState, ScrollStates};
@@ -56,6 +57,8 @@ pub struct AppState {
     pub layout: FrameLayout,
     pub activity: ActivityState,
     pub tmux_pane: String,
+    /// Last daemon snapshot generation applied by this frontend.
+    pub shared_snapshot_generation: u64,
     /// Scroll offsets for the agents list and git tab. Activity tab
     /// scroll lives in [`ActivityState::scroll`].
     pub scrolls: ScrollStates,
@@ -165,6 +168,7 @@ impl AppState {
             layout: FrameLayout::default(),
             activity: ActivityState::new(),
             tmux_pane,
+            shared_snapshot_generation: 0,
             scrolls: ScrollStates::default(),
             theme: ColorTheme::default(),
             icons: StatusIcons::default(),

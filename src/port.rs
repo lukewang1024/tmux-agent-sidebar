@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::process::{ProcessSnapshot, command_basename};
 use crate::tmux::SessionInfo;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PaneProcessSnapshot {
     pub ports_by_pane: HashMap<String, Vec<u16>>,
     pub command_by_pane: HashMap<String, String>,

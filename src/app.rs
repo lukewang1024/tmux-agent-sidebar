@@ -34,6 +34,10 @@ fn signal_poll_interval(sidebar_visible: bool) -> Duration {
     }
 }
 
+fn should_handle_input(event: &event::Event, sidebar_focused: bool) -> bool {
+    sidebar_focused || matches!(event, event::Event::Resize(_, _))
+}
+
 mod input;
 mod render;
 mod setup;
@@ -109,10 +113,17 @@ pub fn run(
                     }
                     // Regained focus: re-derive focus/selection state now.
                     event::Event::FocusGained => {
+                        // tmux delivers FocusGained before the input that
+                        // selected this pane. Mark it focused immediately so
+                        // the following event in the same drain batch is not
+                        // discarded while waiting for the refresh pass.
+                        state.focus_state.sidebar_focused = true;
                         needs_refresh.store(true, Ordering::Relaxed);
                     }
                     ev => {
-                        if input::handle_event(ev, &mut state, &git_tab_active, terminal) {
+                        if should_handle_input(&ev, state.focus_state.sidebar_focused)
+                            && input::handle_event(ev, &mut state, &git_tab_active, terminal)
+                        {
                             needs_redraw = true;
                         }
                     }
@@ -145,6 +156,9 @@ pub fn run(
 
         let sigusr1 = needs_refresh.swap(false, Ordering::Relaxed);
         if sigusr1 || last_refresh.elapsed() >= refresh_interval(sidebar_visible) {
+            if sigusr1 {
+                crate::shared_snapshot::invalidate();
+            }
             let previous_focused_pane_id = state.focus_state.focused_pane_id.clone();
             sidebar_visible = state.refresh();
             // A SIGUSR1 poke is either a focus hook or a peer broadcasting a
@@ -208,5 +222,33 @@ mod tests {
         assert_eq!(refresh_interval(false), Duration::from_secs(60));
         assert_eq!(signal_poll_interval(true), Duration::from_millis(16));
         assert_eq!(signal_poll_interval(false), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn unfocused_sidebars_ignore_input_but_still_handle_resize() {
+        assert!(!should_handle_input(
+            &event::Event::Key(event::KeyEvent::new(
+                event::KeyCode::Tab,
+                event::KeyModifiers::NONE,
+            )),
+            false,
+        ));
+        assert!(!should_handle_input(
+            &event::Event::Mouse(event::MouseEvent {
+                kind: event::MouseEventKind::Down(event::MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers: event::KeyModifiers::NONE,
+            }),
+            false,
+        ));
+        assert!(should_handle_input(&event::Event::Resize(80, 24), false));
+        assert!(should_handle_input(
+            &event::Event::Key(event::KeyEvent::new(
+                event::KeyCode::Tab,
+                event::KeyModifiers::NONE,
+            )),
+            true,
+        ));
     }
 }

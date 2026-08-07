@@ -90,7 +90,7 @@ impl AppState {
         self.find_focused_pane();
     }
 
-    fn clear_dead_agent_metadata(pane_id: &str) {
+    pub(crate) fn clear_dead_agent_metadata(pane_id: &str) {
         for key in &[
             tmux::PANE_AGENT,
             tmux::PANE_STATUS,
@@ -113,7 +113,7 @@ impl AppState {
         let _ = std::fs::remove_file(activity::log_file_path(pane_id));
     }
 
-    fn filter_sessions_to_live_agent_panes(
+    pub(crate) fn filter_sessions_to_live_agent_panes(
         sessions: Vec<SessionInfo>,
         live_agent_panes: &HashSet<String>,
     ) -> Vec<SessionInfo> {
@@ -147,8 +147,22 @@ impl AppState {
     /// attached tmux session, i.e. whether a user can currently see it.
     pub fn refresh(&mut self) -> bool {
         self.refresh_now();
-        let (pane_active, window_active, session_attached, _, _) =
-            tmux::get_sidebar_pane_info(&self.tmux_pane);
+        let shared_response =
+            crate::shared_snapshot::query_sessions(self.shared_snapshot_generation);
+        let (pane_active, window_active, session_attached) = shared_response
+            .as_ref()
+            .and_then(|response| response.sidebar_visibility.get(&self.tmux_pane))
+            .map(|visibility| {
+                (
+                    visibility.pane_active,
+                    visibility.window_active,
+                    visibility.session_attached,
+                )
+            })
+            .unwrap_or_else(|| {
+                let (pane, window, attached, _, _) = tmux::get_sidebar_pane_info(&self.tmux_pane);
+                (pane, window, attached)
+            });
         // Treat the sidebar as focused only when it is the active pane, of the
         // active window, of the *attached* session — i.e. the pane the user is
         // actually viewing. window_active/pane_active are both session-local:
@@ -164,31 +178,49 @@ impl AppState {
         // but process discovery is slow-changing and does not need to multiply
         // by every sidebar instance every second.
         const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
-        let (mut sessions, mut process_snapshot) =
-            if let Some(sessions) = crate::shared_snapshot::query_sessions() {
-                (sessions, None)
-            } else if !self.timers.process_scan_initialized
-                || self.timers.last_process_refresh.elapsed() >= PROCESS_REFRESH_INTERVAL
-            {
-                self.timers.process_scan_initialized = true;
-                self.timers.last_process_refresh = std::time::Instant::now();
-                tmux::query_sessions_with_process_snapshot()
-            } else {
-                (tmux::query_sessions_without_process_snapshot(), None)
-            };
-        // Hidden clients only consume the daemon snapshot. The visible client
-        // owns the remaining pane-local maintenance until ports and background
-        // shell state move into the daemon in a later phase.
-        if sidebar_visible {
-            self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
-            if let Some(process_snapshot) =
-                self.refresh_port_data(&sessions, process_snapshot.as_ref())
-            {
-                sessions = Self::filter_sessions_to_live_agent_panes(
-                    sessions,
-                    &process_snapshot.live_agent_panes,
-                );
+        let snapshot_unchanged = shared_response
+            .as_ref()
+            .is_some_and(|response| response.unchanged);
+        let shared_pane_processes = shared_response
+            .as_ref()
+            .and_then(|response| response.pane_processes.clone());
+        let (mut sessions, mut process_snapshot) = if let Some(response) = shared_response {
+            self.shared_snapshot_generation = response.generation;
+            (response.sessions, None)
+        } else if !self.timers.process_scan_initialized
+            || self.timers.last_process_refresh.elapsed() >= PROCESS_REFRESH_INTERVAL
+        {
+            self.timers.process_scan_initialized = true;
+            self.timers.last_process_refresh = std::time::Instant::now();
+            tmux::query_sessions_with_process_snapshot()
+        } else {
+            (tmux::query_sessions_without_process_snapshot(), None)
+        };
+        if snapshot_unchanged {
+            // The daemon generation is unchanged, so preserve the already
+            // materialized repo/pane state and avoid allocation-heavy rebuilds.
+        } else if shared_pane_processes.is_some() {
+            if let Some(scanned) = shared_pane_processes {
+                for session in &sessions {
+                    for window in &session.windows {
+                        for pane in &window.panes {
+                            let pane_state = self.pane_state_mut(&pane.pane_id);
+                            pane_state.ports = scanned
+                                .ports_by_pane
+                                .get(&pane.pane_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            pane_state.command =
+                                scanned.command_by_pane.get(&pane.pane_id).cloned();
+                        }
+                    }
+                }
             }
+            self.apply_session_snapshot(sidebar_focused, sessions);
+        } else if sidebar_visible && self.shared_snapshot_generation == 0 {
+            // Legacy fallback when the daemon could not be reached.
+            self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
+            let _ = self.refresh_port_data(&sessions, process_snapshot.as_ref());
             self.apply_session_snapshot(sidebar_focused, sessions);
         } else {
             self.apply_session_snapshot(sidebar_focused, sessions);

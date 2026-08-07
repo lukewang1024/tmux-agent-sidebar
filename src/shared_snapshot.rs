@@ -5,11 +5,12 @@
 //! clients read its cached snapshot over a per-user Unix socket. If the daemon
 //! cannot be reached, callers simply fall back to the legacy local query path.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -17,19 +18,35 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::port::PaneProcessSnapshot;
 use crate::process::ProcessSnapshot;
+use crate::state::AppState;
 use crate::tmux::{self, SessionInfo};
 
-const PROTOCOL_VERSION: u8 = 1;
-const TMUX_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const PROTOCOL_VERSION: u8 = 2;
+const REQUEST_SNAPSHOT: u8 = 1;
+const REQUEST_INVALIDATE: u8 = 2;
+const TMUX_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const PORT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SnapshotResponse {
-    version: u8,
-    sessions: Vec<SessionInfo>,
+pub(crate) struct SnapshotResponse {
+    pub(crate) version: u8,
+    pub(crate) generation: u64,
+    pub(crate) unchanged: bool,
+    pub(crate) sessions: Vec<SessionInfo>,
+    pub(crate) pane_processes: Option<PaneProcessSnapshot>,
+    pub(crate) sidebar_visibility: HashMap<String, SidebarVisibility>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct SidebarVisibility {
+    pub(crate) pane_active: bool,
+    pub(crate) window_active: bool,
+    pub(crate) session_attached: bool,
 }
 
 struct SnapshotCache {
@@ -37,6 +54,11 @@ struct SnapshotCache {
     processes: Option<ProcessSnapshot>,
     last_tmux_refresh: Option<Instant>,
     last_process_refresh: Option<Instant>,
+    pane_processes: Option<PaneProcessSnapshot>,
+    last_port_refresh: Option<Instant>,
+    sidebar_visibility: HashMap<String, SidebarVisibility>,
+    generation: u64,
+    dirty: bool,
 }
 
 impl SnapshotCache {
@@ -46,22 +68,49 @@ impl SnapshotCache {
             processes: None,
             last_tmux_refresh: None,
             last_process_refresh: None,
+            pane_processes: None,
+            // Do not put a full-system lsof scan on the first client request;
+            // ports are optional decoration and can populate after warm-up.
+            last_port_refresh: Some(Instant::now()),
+            sidebar_visibility: HashMap::new(),
+            generation: 0,
+            dirty: true,
         }
     }
 
-    fn sessions(&mut self) -> Vec<SessionInfo> {
-        if self
-            .last_tmux_refresh
-            .is_some_and(|last| last.elapsed() < TMUX_REFRESH_INTERVAL)
-        {
-            return self.sessions.clone();
-        }
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
 
+    fn snapshot(&mut self, client_generation: u64) -> SnapshotResponse {
+        let fallback_due = self
+            .last_tmux_refresh
+            .is_none_or(|last| last.elapsed() >= TMUX_FALLBACK_REFRESH_INTERVAL);
+        if self.dirty || fallback_due {
+            self.refresh();
+        }
+        let unchanged = client_generation == self.generation;
+        SnapshotResponse {
+            version: PROTOCOL_VERSION,
+            generation: self.generation,
+            unchanged,
+            sessions: if unchanged {
+                Vec::new()
+            } else {
+                self.sessions.clone()
+            },
+            pane_processes: (!unchanged).then(|| self.pane_processes.clone()).flatten(),
+            sidebar_visibility: self.sidebar_visibility.clone(),
+        }
+    }
+
+    fn refresh(&mut self) {
         let process_due = self
             .last_process_refresh
             .is_none_or(|last| last.elapsed() >= PROCESS_REFRESH_INTERVAL);
         if process_due {
-            let (sessions, processes) = tmux::query_sessions_with_process_snapshot();
+            let (mut sessions, mut processes) = tmux::query_sessions_with_process_snapshot();
+            crate::state::sweep_dead_bg_shells(&mut sessions, &mut processes);
             self.sessions = sessions;
             if processes.is_some() {
                 self.processes = processes;
@@ -72,9 +121,66 @@ impl SnapshotCache {
         } else {
             self.sessions = tmux::query_sessions_without_process_snapshot();
         }
+        let port_due = self
+            .last_port_refresh
+            .is_none_or(|last| last.elapsed() >= PORT_REFRESH_INTERVAL);
+        if port_due {
+            if let Some(scanned) =
+                crate::port::scan_session_process_snapshot(&self.sessions, self.processes.as_ref())
+            {
+                for session in &self.sessions {
+                    for window in &session.windows {
+                        for pane in &window.panes {
+                            if !scanned.live_agent_panes.contains(&pane.pane_id) {
+                                AppState::clear_dead_agent_metadata(&pane.pane_id);
+                            }
+                        }
+                    }
+                }
+                self.sessions = AppState::filter_sessions_to_live_agent_panes(
+                    std::mem::take(&mut self.sessions),
+                    &scanned.live_agent_panes,
+                );
+                self.pane_processes = Some(scanned);
+            }
+            self.last_port_refresh = Some(Instant::now());
+        }
         self.last_tmux_refresh = Some(Instant::now());
-        self.sessions.clone()
+        self.sidebar_visibility = query_sidebar_visibility();
+        self.generation = self.generation.wrapping_add(1);
+        self.dirty = false;
     }
+}
+
+fn query_sidebar_visibility() -> HashMap<String, SidebarVisibility> {
+    let Some(output) = tmux::run_tmux(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}|#{pane_active}|#{window_active}|#{session_attached}|#{@pane_role}",
+    ]) else {
+        return HashMap::new();
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('|');
+            let pane_id = fields.next()?;
+            let pane_active = fields.next()? == "1";
+            let window_active = fields.next()? == "1";
+            let session_attached = fields.next()? == "1";
+            (fields.next()? == "sidebar").then(|| {
+                (
+                    pane_id.to_string(),
+                    SidebarVisibility {
+                        pane_active,
+                        window_active,
+                        session_attached,
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 struct DaemonGuard {
@@ -165,37 +271,61 @@ fn run_daemon_inner() -> io::Result<()> {
     let mut cache = SnapshotCache::new();
     let mut last_request = Instant::now();
     loop {
+        let mut poll_fd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 1_000) };
+        if ready == 0 {
+            if last_request.elapsed() >= DAEMON_IDLE_TIMEOUT {
+                return Ok(());
+            }
+            continue;
+        }
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 last_request = Instant::now();
-                let mut request = [0_u8; 1];
+                let mut request = [0_u8; 10];
                 if stream.read_exact(&mut request).is_ok() && request[0] == PROTOCOL_VERSION {
-                    let response = SnapshotResponse {
-                        version: PROTOCOL_VERSION,
-                        sessions: cache.sessions(),
-                    };
-                    let _ = serde_json::to_writer(&mut stream, &response);
-                    let _ = stream.flush();
+                    match request[1] {
+                        REQUEST_SNAPSHOT => {
+                            let generation = u64::from_be_bytes(request[2..10].try_into().unwrap());
+                            let response = cache.snapshot(generation);
+                            let _ = serde_json::to_writer(&mut stream, &response);
+                            let _ = stream.flush();
+                        }
+                        REQUEST_INVALIDATE => cache.invalidate(),
+                        _ => {}
+                    }
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                if last_request.elapsed() >= DAEMON_IDLE_TIMEOUT {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(25));
+                continue;
             }
             Err(err) => return Err(err),
         }
     }
 }
 
-fn request_once() -> Option<Vec<SessionInfo>> {
+fn request_once(generation: u64) -> Option<SnapshotResponse> {
     let mut stream = UnixStream::connect(runtime_path("sock")).ok()?;
     stream.set_read_timeout(Some(CLIENT_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT)).ok()?;
-    stream.write_all(&[PROTOCOL_VERSION]).ok()?;
+    let mut request = [0_u8; 10];
+    request[0] = PROTOCOL_VERSION;
+    request[1] = REQUEST_SNAPSHOT;
+    request[2..].copy_from_slice(&generation.to_be_bytes());
+    stream.write_all(&request).ok()?;
     let response: SnapshotResponse = serde_json::from_reader(stream).ok()?;
-    (response.version == PROTOCOL_VERSION).then_some(response.sessions)
+    (response.version == PROTOCOL_VERSION).then_some(response)
 }
 
 fn spawn_daemon() -> Option<()> {
@@ -213,18 +343,31 @@ fn spawn_daemon() -> Option<()> {
 
 /// Read the shared snapshot, starting the singleton daemon on first use.
 /// Returns `None` on any failure so the TUI can use its local fallback.
-pub fn query_sessions() -> Option<Vec<SessionInfo>> {
-    if let Some(sessions) = request_once() {
-        return Some(sessions);
+pub(crate) fn query_sessions(generation: u64) -> Option<SnapshotResponse> {
+    if let Some(response) = request_once(generation) {
+        return Some(response);
     }
     spawn_daemon()?;
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(25));
-        if let Some(sessions) = request_once() {
-            return Some(sessions);
+        if let Some(response) = request_once(generation) {
+            return Some(response);
         }
     }
     None
+}
+
+/// Mark the daemon's global snapshot dirty after an agent or tmux event.
+/// This is deliberately fire-and-forget: hooks must never wait for daemon
+/// startup or make agent execution depend on sidebar availability.
+pub fn invalidate() {
+    let Ok(mut stream) = UnixStream::connect(runtime_path("sock")) else {
+        return;
+    };
+    let mut request = [0_u8; 10];
+    request[0] = PROTOCOL_VERSION;
+    request[1] = REQUEST_INVALIDATE;
+    let _ = stream.write_all(&request);
 }
 
 #[cfg(test)]
@@ -235,11 +378,16 @@ mod tests {
     fn response_round_trips() {
         let response = SnapshotResponse {
             version: PROTOCOL_VERSION,
+            generation: 7,
+            unchanged: false,
             sessions: vec![],
+            pane_processes: None,
+            sidebar_visibility: HashMap::new(),
         };
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: SnapshotResponse = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.generation, 7);
         assert!(decoded.sessions.is_empty());
     }
 

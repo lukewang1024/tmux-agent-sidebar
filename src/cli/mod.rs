@@ -28,6 +28,10 @@ pub fn run(args: &[String]) -> Option<i32> {
         "spawn" => spawn::cmd_spawn(rest),
         "capture" => capture::cmd_capture(rest),
         "daemon" => crate::shared_snapshot::run_daemon(),
+        "invalidate" => {
+            crate::shared_snapshot::invalidate();
+            0
+        }
         "--version" | "version" => {
             println!("{}", crate::VERSION);
             0

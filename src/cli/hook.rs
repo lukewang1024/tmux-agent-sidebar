@@ -34,7 +34,9 @@ pub(crate) fn cmd_hook(args: &[String]) -> i32 {
         return 0;
     };
 
-    handle_event(&pane, agent_name, event)
+    let code = handle_event(&pane, agent_name, event);
+    crate::shared_snapshot::invalidate();
+    code
 }
 
 // ─── event handler ──────────────────────────────────────────────────────────
