@@ -1634,6 +1634,7 @@ dependencies = [
  "libc",
  "ratatui",
  "scopeguard",
+ "serde",
  "serde_json",
  "tempfile",
  "unicode-width",

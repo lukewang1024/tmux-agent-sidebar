@@ -164,22 +164,31 @@ impl AppState {
         // but process discovery is slow-changing and does not need to multiply
         // by every sidebar instance every second.
         const PROCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
-        let (mut sessions, mut process_snapshot) = if !self.timers.process_scan_initialized
-            || self.timers.last_process_refresh.elapsed() >= PROCESS_REFRESH_INTERVAL
-        {
-            self.timers.process_scan_initialized = true;
-            self.timers.last_process_refresh = std::time::Instant::now();
-            tmux::query_sessions_with_process_snapshot()
-        } else {
-            (tmux::query_sessions_without_process_snapshot(), None)
-        };
-        self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
-        if let Some(process_snapshot) = self.refresh_port_data(&sessions, process_snapshot.as_ref())
-        {
-            let sessions = Self::filter_sessions_to_live_agent_panes(
-                sessions,
-                &process_snapshot.live_agent_panes,
-            );
+        let (mut sessions, mut process_snapshot) =
+            if let Some(sessions) = crate::shared_snapshot::query_sessions() {
+                (sessions, None)
+            } else if !self.timers.process_scan_initialized
+                || self.timers.last_process_refresh.elapsed() >= PROCESS_REFRESH_INTERVAL
+            {
+                self.timers.process_scan_initialized = true;
+                self.timers.last_process_refresh = std::time::Instant::now();
+                tmux::query_sessions_with_process_snapshot()
+            } else {
+                (tmux::query_sessions_without_process_snapshot(), None)
+            };
+        // Hidden clients only consume the daemon snapshot. The visible client
+        // owns the remaining pane-local maintenance until ports and background
+        // shell state move into the daemon in a later phase.
+        if sidebar_visible {
+            self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
+            if let Some(process_snapshot) =
+                self.refresh_port_data(&sessions, process_snapshot.as_ref())
+            {
+                sessions = Self::filter_sessions_to_live_agent_panes(
+                    sessions,
+                    &process_snapshot.live_agent_panes,
+                );
+            }
             self.apply_session_snapshot(sidebar_focused, sessions);
         } else {
             self.apply_session_snapshot(sidebar_focused, sessions);

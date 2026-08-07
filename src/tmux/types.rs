@@ -1,8 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 pub const CLAUDE_AGENT: &str = "claude";
 pub const CODEX_AGENT: &str = "codex";
 pub const OPENCODE_AGENT: &str = "opencode";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
     pub pane_active: bool,
@@ -32,13 +34,13 @@ pub struct PaneInfo {
     pub bg_shell_cmd: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorktreeMetadata {
     pub name: String,
     pub branch: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneStatus {
     Running,
     Background,
@@ -48,7 +50,7 @@ pub enum PaneStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PermissionMode {
     Default,
     Plan,
@@ -87,7 +89,7 @@ impl PermissionMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AgentType {
     Claude,
     Codex,
@@ -96,7 +98,7 @@ pub enum AgentType {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub window_id: String,
     pub window_name: String,
@@ -105,7 +107,7 @@ pub struct WindowInfo {
     pub panes: Vec<PaneInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_name: String,
     pub windows: Vec<WindowInfo>,

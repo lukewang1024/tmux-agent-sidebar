@@ -127,16 +127,44 @@ pub(crate) fn query_sessions_without_process_snapshot() -> Vec<SessionInfo> {
     query_sessions_impl(false).0
 }
 
+pub(crate) fn query_sessions_with_cached_process_snapshot(
+    process_snapshot: &ProcessSnapshot,
+) -> Vec<SessionInfo> {
+    let pane_format = pane_format();
+    let Some(all_panes_output) = run_tmux(&["list-panes", "-a", "-F", &pane_format]) else {
+        return vec![];
+    };
+    let process_snapshot =
+        pane_output_needs_process_snapshot(&all_panes_output).then_some(process_snapshot);
+    let (mut sessions_map, codex_pids) =
+        build_session_hierarchy(&all_panes_output, process_snapshot);
+    if !codex_pids.is_empty()
+        && let Some(snapshot) = process_snapshot
+    {
+        resolve_codex_permission_modes(&mut sessions_map, &codex_pids, snapshot);
+    }
+    finalize_sessions(sessions_map)
+}
+
 fn query_sessions_impl(scan_processes: bool) -> (Vec<SessionInfo>, Option<ProcessSnapshot>) {
+    query_sessions_from_snapshot(None, scan_processes)
+}
+
+fn query_sessions_from_snapshot(
+    process_snapshot: Option<ProcessSnapshot>,
+    scan_processes: bool,
+) -> (Vec<SessionInfo>, Option<ProcessSnapshot>) {
     let pane_format = pane_format();
     let all_panes_output = match run_tmux(&["list-panes", "-a", "-F", &pane_format]) {
         Some(s) => s,
         None => return (vec![], None),
     };
 
-    let process_snapshot = scan_processes
-        .then(|| process_snapshot_for_panes(&all_panes_output))
-        .flatten();
+    let process_snapshot = if pane_output_needs_process_snapshot(&all_panes_output) {
+        process_snapshot.or_else(|| scan_processes.then(ProcessSnapshot::scan).flatten())
+    } else {
+        None
+    };
     let (mut sessions_map, codex_pids) =
         build_session_hierarchy(&all_panes_output, process_snapshot.as_ref());
     if !codex_pids.is_empty()
@@ -603,13 +631,6 @@ fn detect_codex_permission_mode(args: &str) -> PermissionMode {
         return PermissionMode::Auto;
     }
     PermissionMode::Default
-}
-
-fn process_snapshot_for_panes(all_panes_output: &str) -> Option<ProcessSnapshot> {
-    if !pane_output_needs_process_snapshot(all_panes_output) {
-        return None;
-    }
-    ProcessSnapshot::scan()
 }
 
 fn pane_output_needs_process_snapshot(all_panes_output: &str) -> bool {
