@@ -17,7 +17,10 @@ function finish {
     fi
     if [[ $exit_code -eq 0 ]]; then
         echo "Reloading tmux.conf"
-        tmux source ~/.tmux.conf
+        # Reload is best-effort: installing the binary must still succeed when
+        # no tmux server is running or the config follows the XDG layout.
+        local tmux_conf="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
+        tmux source-file "$tmux_conf" 2>/dev/null || true
         exit 0
     else
         echo "Something went wrong. Press any key to close this window."
