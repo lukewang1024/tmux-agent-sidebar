@@ -6,7 +6,7 @@ mod types;
 
 pub use commands::{
     display_message, kill_window, new_window, notify_other_sidebars, pane_session_name, run_tmux,
-    run_tmux_capture, select_pane, send_command, set_window_option,
+    run_tmux_capture, select_pane, select_pane_from_sidebar, send_command, set_window_option,
 };
 pub use options::{
     BG_CMD_PLACEHOLDER, PANE_AGENT, PANE_AGENT_MISSING_SINCE, PANE_ATTENTION, PANE_BG_CMD,

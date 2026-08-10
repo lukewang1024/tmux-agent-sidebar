@@ -136,3 +136,46 @@ pub fn select_pane(pane_id: &str) {
     }
     let _ = run_tmux(&["select-pane", "-t", pane_id]);
 }
+
+/// Jump from a sidebar to an agent pane without leaving the source window's
+/// remembered active pane on the sidebar itself.
+///
+/// tmux stores an active pane independently for every window. When a click in
+/// the sidebar jumps to another window, first restore the source window's last
+/// pane; otherwise a later normal tmux switch back to that window lands on the
+/// sidebar and requires an extra manual focus change.
+pub fn select_pane_from_sidebar(sidebar_pane_id: &str, target_pane_id: &str) {
+    let source_window_id = display_message(sidebar_pane_id, "#{window_id}");
+    let target_window_id = display_message(target_pane_id, "#{window_id}");
+    if should_restore_source_window(&source_window_id, &target_window_id) {
+        let _ = run_tmux(&["select-pane", "-t", sidebar_pane_id, "-l"]);
+    }
+    select_pane(target_pane_id);
+}
+
+fn should_restore_source_window(source_window_id: &str, target_window_id: &str) -> bool {
+    !source_window_id.is_empty()
+        && !target_window_id.is_empty()
+        && source_window_id != target_window_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_restore_source_window;
+
+    #[test]
+    fn cross_window_sidebar_jump_restores_source_focus() {
+        assert!(should_restore_source_window("@1", "@2"));
+    }
+
+    #[test]
+    fn same_window_sidebar_jump_keeps_direct_selection_path() {
+        assert!(!should_restore_source_window("@1", "@1"));
+    }
+
+    #[test]
+    fn unresolved_window_does_not_mutate_source_focus() {
+        assert!(!should_restore_source_window("", "@2"));
+        assert!(!should_restore_source_window("@1", ""));
+    }
+}
