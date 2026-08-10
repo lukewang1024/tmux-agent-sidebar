@@ -21,6 +21,7 @@ pub struct PaneRuntimeState {
     /// Used by `refresh_task_progress` to skip the (potentially expensive)
     /// re-parse when the log has not been touched since the previous tick.
     pub task_progress_log_mtime: Option<std::time::SystemTime>,
+    pub task_progress_log_len: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +163,7 @@ mod tests {
         assert!(state.inactive_since.is_none());
         assert!(state.tab_pref.is_none());
         assert!(state.task_progress_log_mtime.is_none());
+        assert!(state.task_progress_log_len.is_none());
     }
 
     #[test]

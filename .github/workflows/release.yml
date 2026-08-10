@@ -19,7 +19,10 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             asset: tmux-agent-sidebar-darwin-x86_64
-          - target: x86_64-unknown-linux-gnu
+          # Keep the x86_64 release runnable on older devboxes. Building the
+          # GNU target on ubuntu-latest inherits the runner's glibc baseline,
+          # which made downstream.2 require glibc 2.39 and fail on glibc 2.28.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             asset: tmux-agent-sidebar-linux-x86_64
           - target: aarch64-unknown-linux-gnu
@@ -41,6 +44,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

@@ -54,6 +54,12 @@ pub fn log_mtime(pane_id: &str) -> Option<std::time::SystemTime> {
         .and_then(|m| m.modified().ok())
 }
 
+/// Byte length of a pane's activity log, used with the mtime to detect
+/// multiple appends that land within the filesystem's timestamp resolution.
+pub fn log_len(pane_id: &str) -> Option<u64> {
+    fs::metadata(log_file_path(pane_id)).ok().map(|m| m.len())
+}
+
 fn parse_entry(line: &str) -> Option<ActivityEntry> {
     let mut parts = line.splitn(3, '|');
     let timestamp = parts.next()?.to_string();

@@ -24,6 +24,7 @@ struct PaneTaskUpdate {
     dismissed_total: Option<usize>,
     inactive_since: Option<u64>,
     log_mtime: Option<std::time::SystemTime>,
+    log_len: Option<u64>,
 }
 
 pub(crate) fn classify_task_progress(
@@ -310,6 +311,7 @@ impl AppState {
             for (pane, _) in &group.panes {
                 let prior_state = self.pane_state(&pane.pane_id).cloned().unwrap_or_default();
                 let current_mtime = activity::log_mtime(&pane.pane_id);
+                let current_len = activity::log_len(&pane.pane_id);
                 // Skip the (full-file) re-parse when the activity log
                 // hasn't been touched since the last tick AND the pane
                 // is still active. We must still re-evaluate the
@@ -317,8 +319,9 @@ impl AppState {
                 // long-stalled progress bar gets dismissed even if the
                 // log file itself stops changing.
                 let agent_active = pane.status.is_active();
-                let log_unchanged =
-                    current_mtime.is_some() && current_mtime == prior_state.task_progress_log_mtime;
+                let log_unchanged = current_mtime.is_some()
+                    && current_mtime == prior_state.task_progress_log_mtime
+                    && current_len == prior_state.task_progress_log_len;
                 if log_unchanged && agent_active {
                     // Just refresh the mtime bookkeeping so we don't
                     // accidentally drop the cache on a future iteration
@@ -331,6 +334,7 @@ impl AppState {
                         dismissed_total: prior_state.task_dismissed_total,
                         inactive_since: None,
                         log_mtime: current_mtime,
+                        log_len: current_len,
                     });
                     continue;
                 }
@@ -384,6 +388,7 @@ impl AppState {
                     dismissed_total: next_dismissed_total,
                     inactive_since: next_inactive_since,
                     log_mtime: current_mtime,
+                    log_len: current_len,
                 });
             }
         }
@@ -393,6 +398,7 @@ impl AppState {
             pane_state.task_dismissed_total = update.dismissed_total;
             pane_state.task_progress = update.progress;
             pane_state.task_progress_log_mtime = update.log_mtime;
+            pane_state.task_progress_log_len = update.log_len;
         }
     }
 
