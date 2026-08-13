@@ -460,8 +460,24 @@ fn codex_completed_response(pane_id: &str, session_id: &str) -> Option<String> {
         set_pane_option(pane_id, PANE_TRANSCRIPT_PATH, path.to_str()?);
         path
     };
-    let tail = read_file_tail(&transcript, 256 * 1024)?;
-    completed_response_from_jsonl(&tail)
+    completed_response_from_file(&transcript)
+}
+
+fn completed_response_from_file(path: &Path) -> Option<String> {
+    const INITIAL_TAIL_BYTES: u64 = 256 * 1024;
+
+    let len = std::fs::metadata(path).ok()?.len();
+    let mut max_bytes = INITIAL_TAIL_BYTES.min(len);
+    loop {
+        let tail = read_file_tail(path, max_bytes)?;
+        if let Some(response) = completed_response_from_jsonl(&tail) {
+            return Some(response);
+        }
+        if max_bytes >= len {
+            return None;
+        }
+        max_bytes = max_bytes.saturating_mul(2).min(len);
+    }
 }
 
 fn cached_transcript_matches_session(cached: &str, session_id: &str) -> bool {
@@ -517,16 +533,15 @@ fn completed_response_from_jsonl(transcript_tail: &str) -> Option<String> {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    let last_started = events.iter().rposition(|value| {
-        value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started")
-    })?;
     let last_completed = events.iter().rposition(|value| {
         value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_complete")
     })?;
-    if last_completed <= last_started {
+    if events[last_completed + 1..].iter().any(|value| {
+        value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started")
+    }) {
         return None;
     }
-    events[last_started..last_completed]
+    events[..last_completed]
         .iter()
         .rev()
         .find_map(completed_response_message)
@@ -1394,6 +1409,25 @@ mod tests {
             completed_response_from_jsonl(transcript).as_deref(),
             Some("final result")
         );
+    }
+
+    #[test]
+    fn transcript_completion_expands_past_initial_tail_window() {
+        let transcript = format!(
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n{}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{{\"type\":\"output_text\",\"text\":\"large turn done\"}}]}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\"}}}}",
+            "x".repeat(300 * 1024)
+        );
+        let path = std::env::temp_dir().join(format!(
+            "tmux-agent-sidebar-long-transcript-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, transcript).expect("write long transcript fixture");
+
+        assert_eq!(
+            completed_response_from_file(&path).as_deref(),
+            Some("large turn done")
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
