@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::process::{ProcessSnapshot, command_basename, process_matches_agent};
@@ -312,14 +312,37 @@ fn parse_pane_fields_with_processes(
 
     let pane_id = &parts[pane_line_field::PANE_ID];
     let stored_status = PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]);
-    let session_id_value = &parts[pane_line_field::SESSION_ID];
+    let pane_path = if parts[pane_line_field::PANE_CWD].is_empty() {
+        parts[pane_line_field::PANE_CURRENT_PATH].as_str()
+    } else {
+        parts[pane_line_field::PANE_CWD].as_str()
+    };
+    let mut session_id_value = parts[pane_line_field::SESSION_ID].clone();
+    let mut recovered_live_prompt = None;
+    if agent == AgentType::Codex && process_discovered && session_id_value.is_empty() {
+        if let Some(active) = find_active_codex_transcript(pane_path) {
+            if !codex_session_bound_to_other_pane(&active.session_id, pane_id) {
+                session_id_value = active.session_id;
+                recovered_live_prompt = Some(active.prompt);
+                set_pane_option(pane_id, PANE_AGENT, CODEX_AGENT);
+                set_pane_option(pane_id, PANE_CWD, pane_path);
+                set_pane_option(pane_id, PANE_SESSION_ID, &session_id_value);
+                set_pane_option(
+                    pane_id,
+                    PANE_TRANSCRIPT_PATH,
+                    active.path.to_str().unwrap_or(""),
+                );
+                set_pane_option(pane_id, PANE_STATUS, "running");
+            }
+        }
+    }
     let session_bound_message = matches!(agent, AgentType::Codex | AgentType::Traex);
     let awaiting_session_id = session_bound_message && session_id_value.is_empty();
     // Completed Codex/Traex messages come from the transcript selected by the
     // current session id. `@pane_prompt` remains useful for a live submitted
     // user prompt, but is never the source of truth for a completed response.
     let transcript_completion = if session_bound_message && !session_id_value.is_empty() {
-        codex_completed_response(pane_id, session_id_value)
+        codex_completed_response(pane_id, &session_id_value)
     } else {
         None
     };
@@ -364,12 +387,7 @@ fn parse_pane_fields_with_processes(
     }
 
     // Prefer @pane_cwd (set by hook from agent's cwd) over pane_current_path
-    let pane_cwd = &parts[pane_line_field::PANE_CWD];
-    let path = if !pane_cwd.is_empty() {
-        pane_cwd.to_string()
-    } else {
-        parts[pane_line_field::PANE_CURRENT_PATH].to_string()
-    };
+    let path = pane_path.to_string();
 
     // Claude: read permission_mode from hook-set tmux variable.
     // Codex / OpenCode: no permission_mode in hooks, keep the default.
@@ -389,13 +407,15 @@ fn parse_pane_fields_with_processes(
     let prompt = if awaiting_session_id {
         String::new()
     } else if session_bound_message {
-        sanitized_completion.unwrap_or_else(|| {
-            if parts[pane_line_field::PROMPT_SOURCE] == "response" {
-                String::new()
-            } else {
-                sanitize_prompt(&parts[pane_line_field::PROMPT])
-            }
-        })
+        sanitized_completion
+            .or(recovered_live_prompt.clone())
+            .unwrap_or_else(|| {
+                if parts[pane_line_field::PROMPT_SOURCE] == "response" {
+                    String::new()
+                } else {
+                    sanitize_prompt(&parts[pane_line_field::PROMPT])
+                }
+            })
     } else {
         sanitize_prompt(&parts[pane_line_field::PROMPT])
     };
@@ -403,12 +423,14 @@ fn parse_pane_fields_with_processes(
     let session_id = if session_id_value.is_empty() {
         None
     } else {
-        Some(session_id_value.to_string())
+        Some(session_id_value)
     };
 
     Some(PaneInfo {
         pane_active: parts[pane_line_field::PANE_ACTIVE] == "1",
-        status: if awaiting_session_id || transcript_completion.is_some() || process_discovered {
+        status: if recovered_live_prompt.is_some() {
+            PaneStatus::Running
+        } else if awaiting_session_id || transcript_completion.is_some() || process_discovered {
             PaneStatus::Idle
         } else {
             stored_status
@@ -494,6 +516,117 @@ fn find_codex_session_transcript(session_id: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
     find_session_file(&codex_home.join("sessions"), session_id)
+}
+
+struct ActiveCodexTranscript {
+    path: PathBuf,
+    session_id: String,
+    prompt: String,
+}
+
+fn find_active_codex_transcript(cwd: &str) -> Option<ActiveCodexTranscript> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    let mut candidates = Vec::new();
+    collect_session_files(&codex_home.join("sessions"), &mut candidates);
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    });
+
+    for path in candidates.into_iter().rev() {
+        let file = std::fs::File::open(&path).ok()?;
+        let mut lines = BufReader::new(file).lines();
+        let first: serde_json::Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
+        if first.pointer("/payload/cwd").and_then(|v| v.as_str()) != Some(cwd) {
+            continue;
+        }
+        let session_id = first
+            .pointer("/payload/session_id")
+            .and_then(|v| v.as_str())?
+            .to_string();
+        let transcript = std::fs::read_to_string(&path).ok()?;
+        let prompt = active_codex_prompt(&transcript)?;
+        return Some(ActiveCodexTranscript {
+            path,
+            session_id,
+            prompt,
+        });
+    }
+    None
+}
+
+fn active_codex_prompt(transcript: &str) -> Option<String> {
+    let events: Vec<serde_json::Value> = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let started = events.iter().rposition(|event| {
+        event.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started")
+    })?;
+    let completed = events.iter().rposition(|event| {
+        event.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_complete")
+    });
+    if completed.is_some_and(|index| index > started) {
+        return None;
+    }
+    events[..started]
+        .iter()
+        .rev()
+        .find_map(codex_user_message)
+        .map(|message| sanitize_prompt(&message))
+}
+
+fn collect_session_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn codex_user_message(value: &serde_json::Value) -> Option<String> {
+    let payload = value.get("payload")?;
+    if value.get("type")?.as_str()? != "response_item"
+        || payload.get("type")?.as_str()? != "message"
+        || payload.get("role")?.as_str()? != "user"
+    {
+        return None;
+    }
+    let text = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("input_text"))
+        .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+fn codex_session_bound_to_other_pane(session_id: &str, pane_id: &str) -> bool {
+    let Some(bindings) = run_tmux(&["list-panes", "-a", "-F", "#{pane_id}|#{@pane_session_id}"])
+    else {
+        return false;
+    };
+    session_binding_in_use(&bindings, session_id, pane_id)
+}
+
+fn session_binding_in_use(bindings: &str, session_id: &str, pane_id: &str) -> bool {
+    bindings.lines().any(|line| {
+        let Some((bound_pane, bound_session)) = line.split_once('|') else {
+            return false;
+        };
+        bound_pane != pane_id && bound_session == session_id
+    })
 }
 
 fn find_session_file(root: &Path, session_id: &str) -> Option<PathBuf> {
@@ -1428,6 +1561,38 @@ mod tests {
             Some("large turn done")
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn active_transcript_recovers_latest_user_prompt_without_hooks() {
+        let transcript = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current prompt"}]}}
+{"type":"event_msg","payload":{"type":"task_started"}}"#;
+
+        assert_eq!(
+            active_codex_prompt(transcript).as_deref(),
+            Some("current prompt")
+        );
+    }
+
+    #[test]
+    fn completed_transcript_is_not_recovered_as_running() {
+        let transcript = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"done prompt"}]}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+
+        assert_eq!(active_codex_prompt(transcript), None);
+    }
+
+    #[test]
+    fn active_session_cannot_bind_to_two_panes() {
+        let bindings = "%1|session-a\n%2|session-b\n";
+
+        assert!(session_binding_in_use(bindings, "session-a", "%3"));
+        assert!(!session_binding_in_use(bindings, "session-a", "%1"));
+        assert!(!session_binding_in_use(bindings, "session-c", "%3"));
     }
 
     #[test]
