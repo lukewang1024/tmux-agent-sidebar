@@ -319,12 +319,15 @@ fn parse_pane_fields_with_processes(
     };
     let mut session_id_value = parts[pane_line_field::SESSION_ID].clone();
     let mut recovered_live_prompt = None;
-    if agent == AgentType::Codex && process_discovered && session_id_value.is_empty() {
-        if let Some(active) = find_active_codex_transcript(pane_path) {
+    if matches!(agent, AgentType::Codex | AgentType::Traex)
+        && process_discovered
+        && session_id_value.is_empty()
+    {
+        if let Some(active) = find_active_session_transcript(&agent, pane_path) {
             if !codex_session_bound_to_other_pane(&active.session_id, pane_id) {
                 session_id_value = active.session_id;
                 recovered_live_prompt = Some(active.prompt);
-                set_pane_option(pane_id, PANE_AGENT, CODEX_AGENT);
+                set_pane_option(pane_id, PANE_AGENT, agent.as_str());
                 set_pane_option(pane_id, PANE_CWD, pane_path);
                 set_pane_option(pane_id, PANE_SESSION_ID, &session_id_value);
                 set_pane_option(
@@ -342,7 +345,7 @@ fn parse_pane_fields_with_processes(
     // current session id. `@pane_prompt` remains useful for a live submitted
     // user prompt, but is never the source of truth for a completed response.
     let transcript_completion = if session_bound_message && !session_id_value.is_empty() {
-        codex_completed_response(pane_id, &session_id_value)
+        session_completed_response(pane_id, &agent, &session_id_value)
     } else {
         None
     };
@@ -473,12 +476,16 @@ fn parse_pane_fields_with_processes(
     })
 }
 
-fn codex_completed_response(pane_id: &str, session_id: &str) -> Option<String> {
+fn session_completed_response(
+    pane_id: &str,
+    agent: &AgentType,
+    session_id: &str,
+) -> Option<String> {
     let cached = get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH);
     let transcript = if cached_transcript_matches_session(&cached, session_id) {
         PathBuf::from(cached)
     } else {
-        let path = find_codex_session_transcript(session_id)?;
+        let path = find_session_transcript(agent, session_id)?;
         set_pane_option(pane_id, PANE_TRANSCRIPT_PATH, path.to_str()?);
         path
     };
@@ -511,25 +518,40 @@ fn cached_transcript_matches_session(cached: &str, session_id: &str) -> bool {
             .is_some_and(|name| name.contains(session_id))
 }
 
-fn find_codex_session_transcript(session_id: &str) -> Option<PathBuf> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    find_session_file(&codex_home.join("sessions"), session_id)
+fn session_root(agent: &AgentType) -> Option<PathBuf> {
+    match agent {
+        AgentType::Codex => std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .map(|home| home.join("sessions")),
+        AgentType::Traex => std::env::var_os("TRAE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".trae")))
+            .map(|home| home.join("cli/sessions")),
+        _ => None,
+    }
 }
 
-struct ActiveCodexTranscript {
+fn find_session_transcript(agent: &AgentType, session_id: &str) -> Option<PathBuf> {
+    find_session_file(&session_root(agent)?, session_id)
+}
+
+struct ActiveSessionTranscript {
     path: PathBuf,
     session_id: String,
     prompt: String,
 }
 
-fn find_active_codex_transcript(cwd: &str) -> Option<ActiveCodexTranscript> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+fn find_active_session_transcript(agent: &AgentType, cwd: &str) -> Option<ActiveSessionTranscript> {
+    find_active_session_transcript_in(&session_root(agent)?, cwd)
+}
+
+fn find_active_session_transcript_in(
+    session_root: &Path,
+    cwd: &str,
+) -> Option<ActiveSessionTranscript> {
     let mut candidates = Vec::new();
-    collect_session_files(&codex_home.join("sessions"), &mut candidates);
+    collect_session_files(session_root, &mut candidates);
     candidates.sort_by_key(|path| {
         std::fs::metadata(path)
             .and_then(|meta| meta.modified())
@@ -545,11 +567,12 @@ fn find_active_codex_transcript(cwd: &str) -> Option<ActiveCodexTranscript> {
         }
         let session_id = first
             .pointer("/payload/session_id")
+            .or_else(|| first.pointer("/payload/id"))
             .and_then(|v| v.as_str())?
             .to_string();
         let transcript = std::fs::read_to_string(&path).ok()?;
         let prompt = active_codex_prompt(&transcript)?;
-        return Some(ActiveCodexTranscript {
+        return Some(ActiveSessionTranscript {
             path,
             session_id,
             prompt,
@@ -1575,6 +1598,25 @@ mod tests {
             active_codex_prompt(transcript).as_deref(),
             Some("current prompt")
         );
+    }
+
+    #[test]
+    fn traex_session_meta_id_recovers_active_transcript_without_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root.path().join("rollout-traex-session.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"session_meta","payload":{"id":"traex-session","cwd":"/repo"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}}
+{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        )
+        .unwrap();
+
+        let active = find_active_session_transcript_in(root.path(), "/repo")
+            .expect("active TraeX transcript should be recovered");
+        assert_eq!(active.session_id, "traex-session");
+        assert_eq!(active.prompt, "fix it");
+        assert_eq!(active.path, transcript);
     }
 
     #[test]
