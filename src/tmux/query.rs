@@ -349,6 +349,13 @@ fn parse_pane_fields_with_processes(
     } else {
         None
     };
+    if recovered_live_prompt.is_none()
+        && transcript_completion.is_none()
+        && session_bound_message
+        && !session_id_value.is_empty()
+    {
+        recovered_live_prompt = session_active_prompt(pane_id, &agent, &session_id_value);
+    }
     let sanitized_completion = transcript_completion.as_deref().map(sanitize_prompt);
 
     // Codex / OpenCode panes can leave stale tmux metadata behind after the
@@ -490,6 +497,18 @@ fn session_completed_response(
         path
     };
     completed_response_from_file(&transcript)
+}
+
+fn session_active_prompt(pane_id: &str, agent: &AgentType, session_id: &str) -> Option<String> {
+    let cached = get_pane_option_value(pane_id, PANE_TRANSCRIPT_PATH);
+    let transcript = if cached_transcript_matches_session(&cached, session_id) {
+        PathBuf::from(cached)
+    } else {
+        let path = find_session_transcript(agent, session_id)?;
+        set_pane_option(pane_id, PANE_TRANSCRIPT_PATH, path.to_str()?);
+        path
+    };
+    active_codex_prompt(&std::fs::read_to_string(transcript).ok()?)
 }
 
 fn completed_response_from_file(path: &Path) -> Option<String> {
@@ -1693,6 +1712,34 @@ mod tests {
             !test_mock::contains(pane, PANE_PROMPT_SOURCE),
             "the transcript remains the response source of truth"
         );
+    }
+
+    #[test]
+    fn bound_traex_session_refreshes_prompt_without_hooks() {
+        let _guard = test_mock::install();
+        let pane = "%TRAEX_BOUND_ACTIVE";
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript = transcript_dir.path().join("rollout-traex-active.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"session_meta","payload":{"id":"traex-active","cwd":"/repo"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current TraeX request"}]}}"#,
+        )
+        .unwrap();
+        test_mock::set(pane, PANE_TRANSCRIPT_PATH, transcript.to_str().unwrap());
+
+        let mut fields = full_fields();
+        fields[pane_line_field::PANE_ID] = pane;
+        fields[pane_line_field::AGENT] = "traex";
+        fields[pane_line_field::PANE_STATUS] = "running";
+        fields[pane_line_field::PROMPT] = "";
+        fields[pane_line_field::SESSION_ID] = "traex-active";
+
+        let info = parse_pane_line(&make_pane_line(&fields)).unwrap();
+        assert_eq!(info.status, PaneStatus::Running);
+        assert_eq!(info.prompt, "current TraeX request");
+        assert!(!info.prompt_is_response);
     }
 
     #[test]
