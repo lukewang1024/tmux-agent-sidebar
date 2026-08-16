@@ -595,10 +595,11 @@ fn active_codex_prompt(transcript: &str) -> Option<String> {
     if completed.is_some_and(|index| index > started) {
         return None;
     }
-    events[..started]
+    events[started..]
         .iter()
         .rev()
         .find_map(codex_user_message)
+        .or_else(|| events[..started].iter().rev().find_map(codex_user_message))
         .map(|message| sanitize_prompt(&message))
 }
 
@@ -696,6 +697,13 @@ fn completed_response_from_jsonl(transcript_tail: &str) -> Option<String> {
         value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("task_started")
     }) {
         return None;
+    }
+    if let Some(message) = events[last_completed]
+        .pointer("/payload/last_agent_message")
+        .and_then(|value| value.as_str())
+        .filter(|message| !message.is_empty())
+    {
+        return Some(message.to_string());
     }
     events[..last_completed]
         .iter()
@@ -1591,8 +1599,9 @@ mod tests {
         let transcript = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}
 {"type":"event_msg","payload":{"type":"task_started"}}
 {"type":"event_msg","payload":{"type":"task_complete"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current prompt"}]}}
-{"type":"event_msg","payload":{"type":"task_started"}}"#;
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"new date"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current prompt"}]}}"#;
 
         assert_eq!(
             active_codex_prompt(transcript).as_deref(),
@@ -1607,8 +1616,8 @@ mod tests {
         std::fs::write(
             &transcript,
             r#"{"type":"session_meta","payload":{"id":"traex-session","cwd":"/repo"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}}
-{"type":"event_msg","payload":{"type":"task_started"}}"#,
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}}"#,
         )
         .unwrap();
 
@@ -1626,6 +1635,18 @@ mod tests {
 {"type":"event_msg","payload":{"type":"task_complete"}}"#;
 
         assert_eq!(active_codex_prompt(transcript), None);
+    }
+
+    #[test]
+    fn traex_task_complete_supplies_final_message_without_phase() {
+        let transcript = r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"TraeX conclusion"}}"#;
+
+        assert_eq!(
+            completed_response_from_jsonl(transcript).as_deref(),
+            Some("TraeX conclusion")
+        );
     }
 
     #[test]
