@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::process::{ProcessSnapshot, command_basename, process_matches_agent};
 
@@ -306,11 +307,20 @@ fn parse_pane_fields_with_processes(
     let current_command = parts[pane_line_field::PANE_CURRENT_COMMAND].as_str();
     let pane_pid: Option<u32> = parts[pane_line_field::PANE_PID].parse().ok();
     let configured_agent = AgentType::from_label(&parts[pane_line_field::AGENT]);
-    let process_discovered = configured_agent.is_none();
-    let agent = configured_agent
+    let foreground_agent = discover_foreground_agent(current_command);
+    let process_discovered = configured_agent.is_none()
+        || foreground_agent
+            .as_ref()
+            .is_some_and(|foreground| configured_agent.as_ref() != Some(foreground));
+    let agent = foreground_agent
+        .clone()
+        .or(configured_agent.clone())
         .or_else(|| discover_process_agent(current_command, pane_pid, process_snapshot))?;
 
     let pane_id = &parts[pane_line_field::PANE_ID];
+    if foreground_agent.is_some() && foreground_agent != configured_agent {
+        set_pane_option(pane_id, PANE_AGENT, agent.as_str());
+    }
     let stored_status = PaneStatus::from_label(&parts[pane_line_field::PANE_STATUS]);
     let pane_path = if parts[pane_line_field::PANE_CWD].is_empty() {
         parts[pane_line_field::PANE_CURRENT_PATH].as_str()
@@ -319,6 +329,20 @@ fn parse_pane_fields_with_processes(
     };
     let mut session_id_value = parts[pane_line_field::SESSION_ID].clone();
     let mut recovered_live_prompt = None;
+    if let (Some(pid), Some(snapshot)) = (pane_pid, process_snapshot)
+        && let Some(transcript) = process_open_session_transcript(&agent, pid, snapshot)
+        && let Some(bound_session_id) = transcript_session_id(&transcript)
+        && session_id_value != bound_session_id
+    {
+        session_id_value = bound_session_id;
+        set_pane_option(pane_id, PANE_AGENT, agent.as_str());
+        set_pane_option(pane_id, PANE_SESSION_ID, &session_id_value);
+        set_pane_option(
+            pane_id,
+            PANE_TRANSCRIPT_PATH,
+            transcript.to_str().unwrap_or(""),
+        );
+    }
     if matches!(agent, AgentType::Codex | AgentType::Traex)
         && process_discovered
         && session_id_value.is_empty()
@@ -555,6 +579,47 @@ fn find_session_transcript(agent: &AgentType, session_id: &str) -> Option<PathBu
     find_session_file(&session_root(agent)?, session_id)
 }
 
+fn process_open_session_transcript(
+    agent: &AgentType,
+    pane_pid: u32,
+    snapshot: &ProcessSnapshot,
+) -> Option<PathBuf> {
+    let session_root = session_root(agent)?;
+    for pid in snapshot.agent_pids(&[pane_pid], agent) {
+        let output = Command::new("lsof")
+            .args(["-Fn", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if let Some(path) = session_transcript_from_lsof(&output.stdout, &session_root) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn session_transcript_from_lsof(output: &[u8], session_root: &Path) -> Option<PathBuf> {
+    String::from_utf8_lossy(output).lines().find_map(|line| {
+        let path = line.strip_prefix('n').map(PathBuf::from)?;
+        (path.starts_with(session_root)
+            && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .then_some(path)
+    })
+}
+
+fn transcript_session_id(path: &Path) -> Option<String> {
+    let first = std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .next()?
+        .to_string();
+    let first: serde_json::Value = serde_json::from_str(&first).ok()?;
+    first
+        .pointer("/payload/session_id")
+        .or_else(|| first.pointer("/payload/id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 struct ActiveSessionTranscript {
     path: PathBuf,
     session_id: String,
@@ -578,22 +643,35 @@ fn find_active_session_transcript_in(
     });
 
     for path in candidates.into_iter().rev() {
-        let file = std::fs::File::open(&path).ok()?;
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
         let mut lines = BufReader::new(file).lines();
-        let first: serde_json::Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
+        let Some(Ok(first_line)) = lines.next() else {
+            continue;
+        };
+        let Ok(first) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+            continue;
+        };
         if first.pointer("/payload/cwd").and_then(|v| v.as_str()) != Some(cwd) {
             continue;
         }
-        let session_id = first
+        let Some(session_id) = first
             .pointer("/payload/session_id")
             .or_else(|| first.pointer("/payload/id"))
-            .and_then(|v| v.as_str())?
-            .to_string();
-        let transcript = std::fs::read_to_string(&path).ok()?;
-        let prompt = active_codex_prompt(&transcript)?;
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let Ok(transcript) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(prompt) = active_codex_prompt(&transcript) else {
+            continue;
+        };
         return Some(ActiveSessionTranscript {
             path,
-            session_id,
+            session_id: session_id.to_string(),
             prompt,
         });
     }
@@ -617,8 +695,13 @@ fn active_codex_prompt(transcript: &str) -> Option<String> {
     events[started..]
         .iter()
         .rev()
-        .find_map(codex_user_message)
-        .or_else(|| events[..started].iter().rev().find_map(codex_user_message))
+        .find_map(codex_prompt_message)
+        .or_else(|| {
+            events[..started]
+                .iter()
+                .rev()
+                .find_map(codex_prompt_message)
+        })
         .map(|message| sanitize_prompt(&message))
 }
 
@@ -636,11 +719,10 @@ fn collect_session_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn codex_user_message(value: &serde_json::Value) -> Option<String> {
+fn codex_prompt_message(value: &serde_json::Value) -> Option<String> {
     let payload = value.get("payload")?;
     if value.get("type")?.as_str()? != "response_item"
         || payload.get("type")?.as_str()? != "message"
-        || payload.get("role")?.as_str()? != "user"
     {
         return None;
     }
@@ -650,9 +732,46 @@ fn codex_user_message(value: &serde_json::Value) -> Option<String> {
         .iter()
         .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("input_text"))
         .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+        .filter(|text| !is_image_attachment_marker(text))
         .collect::<Vec<_>>()
         .join(" ");
-    (!text.is_empty()).then_some(text)
+    let text = strip_leading_image_label(&text);
+    match payload.get("role")?.as_str()? {
+        "user" if !is_synthetic_context_message(text) => {
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "developer" => extract_untrusted_objective(&text).map(str::to_string),
+        _ => None,
+    }
+}
+
+fn is_image_attachment_marker(text: &str) -> bool {
+    let text = text.trim();
+    (text.starts_with("<image ") && text.ends_with('>')) || text == "</image>"
+}
+
+fn strip_leading_image_label(text: &str) -> &str {
+    let text = text.trim_start();
+    if text.starts_with("[Image #")
+        && let Some(end) = text.find(']')
+    {
+        return text[end + 1..].trim_start();
+    }
+    text
+}
+
+fn is_synthetic_context_message(message: &str) -> bool {
+    let message = message.trim();
+    message.starts_with("<environment_context>") && message.ends_with("</environment_context>")
+}
+
+fn extract_untrusted_objective(message: &str) -> Option<&str> {
+    const OPEN: &str = "<untrusted_objective>";
+    const CLOSE: &str = "</untrusted_objective>";
+    let (_, rest) = message.split_once(OPEN)?;
+    let (objective, _) = rest.split_once(CLOSE)?;
+    let objective = objective.trim();
+    (!objective.is_empty()).then_some(objective)
 }
 
 fn codex_session_bound_to_other_pane(session_id: &str, pane_id: &str) -> bool {
@@ -763,6 +882,18 @@ fn discover_process_agent(
     pane_pid: Option<u32>,
     process_snapshot: Option<&ProcessSnapshot>,
 ) -> Option<AgentType> {
+    if let Some(agent) = discover_foreground_agent(current_command) {
+        return Some(agent);
+    }
+
+    let pid = pane_pid?;
+    let snapshot = process_snapshot?;
+    [AgentType::Codex, AgentType::Traex, AgentType::OpenCode]
+        .into_iter()
+        .find(|agent| snapshot.tree_has_agent(&[pid], agent))
+}
+
+fn discover_foreground_agent(current_command: &str) -> Option<AgentType> {
     let command = current_command
         .split_whitespace()
         .next()
@@ -775,12 +906,7 @@ fn discover_process_agent(
         "opencode" => return Some(AgentType::OpenCode),
         _ => {}
     }
-
-    let pid = pane_pid?;
-    let snapshot = process_snapshot?;
-    [AgentType::Codex, AgentType::Traex, AgentType::OpenCode]
-        .into_iter()
-        .find(|agent| snapshot.tree_has_agent(&[pid], agent))
+    None
 }
 
 /// Wipe all agent-tracked tmux pane options and the activity log file for
@@ -927,12 +1053,42 @@ fn sanitize_prompt(raw: &str) -> String {
     {
         return String::new();
     }
+    // Codex normally stores image attachment markup in separate content
+    // fragments, but copied/truncated messages can contain the opening marker
+    // and the visible prompt in one fragment. A blank line is the boundary
+    // between that metadata block and the user's text.
+    let raw = strip_image_attachment_prefix(raw);
+    let raw = unwrap_display_envelope(raw, "proposed_plan");
     let single_line = raw.replace(['\r', '\n', '|'], " ");
     if single_line.chars().count() > 200 {
         single_line.chars().take(200).collect()
     } else {
         single_line
     }
+}
+
+fn unwrap_display_envelope<'a>(raw: &'a str, tag: &str) -> &'a str {
+    let trimmed = raw.trim();
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(content) = trimmed.strip_prefix(&open) else {
+        return raw;
+    };
+    content.strip_suffix(&close).unwrap_or(content).trim()
+}
+
+fn strip_image_attachment_prefix(raw: &str) -> &str {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with("<image ") {
+        return raw;
+    }
+    if let Some((_, prompt)) = trimmed.split_once("\n\n") {
+        return prompt.trim_start();
+    }
+    if let Some(end) = trimmed.find("</image>") {
+        return trimmed[end + "</image>".len()..].trim_start();
+    }
+    raw
 }
 
 /// Parse subagent list from tmux variable.
@@ -1136,6 +1292,24 @@ mod tests {
     #[test]
     fn sanitize_prompt_keeps_legitimate_angle_brackets() {
         assert_eq!(sanitize_prompt("1 < 2 and 3 > 1"), "1 < 2 and 3 > 1");
+    }
+
+    #[test]
+    fn sanitize_prompt_strips_truncated_image_attachment_prefix() {
+        assert_eq!(
+            sanitize_prompt(
+                "<image name=[Image #1]\n    path=\"/tmp/example.png\"> </i…\n\ncodex 带图片的话，不应该展示 xml"
+            ),
+            "codex 带图片的话，不应该展示 xml"
+        );
+    }
+
+    #[test]
+    fn sanitize_prompt_unwraps_proposed_plan() {
+        assert_eq!(
+            sanitize_prompt("<proposed_plan>\n# 修复方案\n先复现问题\n</proposed_plan>"),
+            "# 修复方案 先复现问题"
+        );
     }
 
     #[test]
@@ -1554,6 +1728,23 @@ mod tests {
     }
 
     #[test]
+    fn foreground_traex_replaces_stale_codex_metadata() {
+        let _guard = test_mock::install();
+        let pane = "%STALE_CODEX_NOW_TRAEX";
+
+        let mut fields = full_fields();
+        fields[pane_line_field::PANE_ID] = pane;
+        fields[pane_line_field::AGENT] = "codex";
+        fields[pane_line_field::PANE_CURRENT_COMMAND] = "traex";
+        fields[pane_line_field::SESSION_ID] = "traex-session";
+
+        let pane_info = parse_pane_line(&make_pane_line(&fields)).expect("Traex pane");
+
+        assert_eq!(pane_info.agent, AgentType::Traex);
+        assert_eq!(test_mock::get(pane, PANE_AGENT).as_deref(), Some("traex"));
+    }
+
+    #[test]
     fn transcript_completion_requires_latest_turn_to_be_complete() {
         let complete = r#"{"type":"event_msg","payload":{"type":"task_started"}}
 {"type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}
@@ -1629,6 +1820,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_prompt_omits_image_attachment_markup() {
+        let value = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "<image name=[Image #1] path=\"/tmp/example.png\">"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                    {"type": "input_text", "text": "</image>"},
+                    {"type": "input_text", "text": "[Image #1] fix the image parser"}
+                ]
+            }
+        });
+
+        assert_eq!(
+            codex_prompt_message(&value).as_deref(),
+            Some("fix the image parser")
+        );
+    }
+
+    #[test]
+    fn traex_goal_uses_objective_instead_of_environment_context() {
+        let transcript = r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Continue working toward the active thread goal.\n\n<untrusted_objective>\nimplement the computer-use adapter\n</untrusted_objective>"}]}}"#;
+
+        assert_eq!(
+            active_codex_prompt(transcript).as_deref(),
+            Some("implement the computer-use adapter")
+        );
+    }
+
+    #[test]
+    fn synthetic_environment_context_is_not_a_prompt() {
+        let transcript = r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}"#;
+
+        assert_eq!(active_codex_prompt(transcript), None);
+    }
+
+    #[test]
     fn traex_session_meta_id_recovers_active_transcript_without_hooks() {
         let root = tempfile::tempdir().unwrap();
         let transcript = root.path().join("rollout-traex-session.jsonl");
@@ -1645,6 +1878,43 @@ mod tests {
         assert_eq!(active.session_id, "traex-session");
         assert_eq!(active.prompt, "fix it");
         assert_eq!(active.path, transcript);
+    }
+
+    #[test]
+    fn active_transcript_search_skips_newer_completed_session() {
+        let root = tempfile::tempdir().unwrap();
+        let active_path = root.path().join("active.jsonl");
+        std::fs::write(
+            &active_path,
+            r#"{"type":"session_meta","payload":{"id":"active","cwd":"/repo"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"still running"}]}}"#,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            root.path().join("completed.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"completed","cwd":"/repo"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .unwrap();
+
+        let active = find_active_session_transcript_in(root.path(), "/repo").unwrap();
+        assert_eq!(active.session_id, "active");
+        assert_eq!(active.prompt, "still running");
+        assert_eq!(active.path, active_path);
+    }
+
+    #[test]
+    fn lsof_output_selects_session_transcript() {
+        let root = Path::new("/home/user/.trae/cli/sessions");
+        let output = b"p123\nfcwd\nn/home/user\nf38\nn/home/user/.trae/cli/sessions/2026/08/18/rollout-session.jsonl\n";
+
+        assert_eq!(
+            session_transcript_from_lsof(output, root),
+            Some(root.join("2026/08/18/rollout-session.jsonl"))
+        );
     }
 
     #[test]

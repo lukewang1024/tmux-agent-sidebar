@@ -98,6 +98,18 @@ impl ProcessSnapshot {
         })
     }
 
+    pub(crate) fn agent_pids(&self, seed_pids: &[u32], agent: &AgentType) -> Vec<u32> {
+        let agent_name = agent.as_str();
+        self.descendants(seed_pids)
+            .into_iter()
+            .filter(|pid| {
+                self.info_by_pid
+                    .get(pid)
+                    .is_some_and(|info| process_matches_agent(info, agent_name))
+            })
+            .collect()
+    }
+
     pub(crate) fn command_lines_for_tree(&self, seed_pids: &[u32]) -> Vec<String> {
         self.descendants(seed_pids)
             .into_iter()
