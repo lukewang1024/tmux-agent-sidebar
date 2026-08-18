@@ -341,7 +341,7 @@ fn request_once(generation: u64) -> Option<SnapshotResponse> {
 
 fn spawn_daemon() -> Option<()> {
     let executable = std::env::current_exe().ok()?;
-    Command::new(executable)
+    let mut child = Command::new(executable)
         .arg("daemon")
         .env_remove("TMUX_PANE")
         .stdin(Stdio::null())
@@ -349,6 +349,11 @@ fn spawn_daemon() -> Option<()> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    // Dropping Child without waiting leaves a zombie once the daemon exits.
+    // Reap it off-thread so a socket-start race never blocks the UI.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Some(())
 }
 
