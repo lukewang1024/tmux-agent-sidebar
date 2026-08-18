@@ -761,8 +761,8 @@ fn strip_leading_image_label(text: &str) -> &str {
 }
 
 fn is_synthetic_context_message(message: &str) -> bool {
-    let message = message.trim();
-    message.starts_with("<environment_context>") && message.ends_with("</environment_context>")
+    let message = message.trim_start();
+    message.starts_with("<environment_context>") || message.starts_with("<codex_internal_context")
 }
 
 fn extract_untrusted_objective(message: &str) -> Option<&str> {
@@ -1050,6 +1050,7 @@ fn sanitize_prompt(raw: &str) -> String {
     if raw.contains("<task-notification>")
         || raw.contains("<system-reminder>")
         || raw.contains("<task-status>")
+        || is_synthetic_context_message(raw)
     {
         return String::new();
     }
@@ -1859,6 +1860,30 @@ mod tests {
 {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}"#;
 
         assert_eq!(active_codex_prompt(transcript), None);
+    }
+
+    #[test]
+    fn truncated_environment_context_is_not_a_prompt() {
+        let transcript = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real request"}]}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n  <files>..."}]}}"#;
+
+        assert_eq!(
+            active_codex_prompt(transcript).as_deref(),
+            Some("real request")
+        );
+    }
+
+    #[test]
+    fn codex_internal_context_is_not_a_prompt() {
+        let transcript = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real request"}]}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">hidden</codex_internal_context>"}]}}"#;
+
+        assert_eq!(
+            active_codex_prompt(transcript).as_deref(),
+            Some("real request")
+        );
     }
 
     #[test]
