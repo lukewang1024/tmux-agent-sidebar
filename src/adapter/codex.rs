@@ -10,8 +10,10 @@ impl CodexAdapter {
     /// Single source of truth for Codex CLI hook wiring. Verified against
     /// Codex CLI's official hook event enum in
     /// `openai/codex:codex-rs/hooks/src/engine/config.rs`, which currently
-    /// defines only: `PreToolUse`, `PostToolUse`, `SessionStart`,
-    /// `UserPromptSubmit`, `Stop`.
+    /// defines: `PreToolUse`, `PermissionRequest`, `PostToolUse`, lifecycle,
+    /// prompt, and subagent events. `PermissionRequest` is the important
+    /// attention edge: it fires before Codex blocks for an approval or a
+    /// user-input decision.
     ///
     /// Caveats:
     /// - `PostToolUse` fires only for Bash (Codex's `PostToolUseToolInput`
@@ -31,6 +33,11 @@ impl CodexAdapter {
             trigger: "UserPromptSubmit",
             matcher: None,
             kind: AgentEventKind::UserPromptSubmit,
+        },
+        HookRegistration {
+            trigger: "PermissionRequest",
+            matcher: None,
+            kind: AgentEventKind::Notification,
         },
         HookRegistration {
             trigger: "Stop",
@@ -75,6 +82,27 @@ pub(crate) fn parse_codex_event(
             agent_id: None,
             session_id: optional_str(input, "session_id"),
         }),
+        "notification" => {
+            let tool_name = json_str(input, "tool_name");
+            let wait_reason = if matches!(
+                tool_name,
+                "request_user_input" | "RequestUserInput" | "functions.request_user_input"
+            ) {
+                "elicitation_dialog"
+            } else {
+                "permission_prompt"
+            };
+            Some(AgentEvent::Notification {
+                agent: agent_name.into(),
+                cwd: json_str(input, "cwd").into(),
+                permission_mode: json_str(input, "permission_mode").into(),
+                wait_reason: wait_reason.into(),
+                meta_only: false,
+                worktree: None,
+                agent_id: None,
+                session_id: optional_str(input, "session_id"),
+            })
+        }
         "stop" => Some(AgentEvent::Stop {
             agent: agent_name.into(),
             cwd: json_str(input, "cwd").into(),
@@ -160,6 +188,54 @@ mod tests {
     }
 
     #[test]
+    fn permission_request_marks_approval_as_waiting() {
+        let event = CodexAdapter
+            .parse(
+                "notification",
+                &json!({
+                    "cwd": "/tmp",
+                    "tool_name": "exec_command",
+                    "session_id": "sess-approval"
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            event,
+            AgentEvent::Notification {
+                agent: CODEX_AGENT.into(),
+                cwd: "/tmp".into(),
+                permission_mode: "".into(),
+                wait_reason: "permission_prompt".into(),
+                meta_only: false,
+                worktree: None,
+                agent_id: None,
+                session_id: Some("sess-approval".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn permission_request_marks_user_decision_as_elicitation() {
+        let event = CodexAdapter
+            .parse(
+                "notification",
+                &json!({"tool_name": "request_user_input", "session_id": "sess-question"}),
+            )
+            .unwrap();
+        match event {
+            AgentEvent::Notification {
+                wait_reason,
+                meta_only,
+                ..
+            } => {
+                assert_eq!(wait_reason, "elicitation_dialog");
+                assert!(!meta_only);
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn stop_has_continue_response() {
         let adapter = CodexAdapter;
         let input = json!({
@@ -218,8 +294,14 @@ mod tests {
     }
 
     #[test]
-    fn notification_not_supported() {
-        assert!(CodexAdapter.parse("notification", &json!({})).is_none());
+    fn notification_defaults_to_permission_prompt() {
+        let event = CodexAdapter.parse("notification", &json!({})).unwrap();
+        match event {
+            AgentEvent::Notification { wait_reason, .. } => {
+                assert_eq!(wait_reason, "permission_prompt")
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
     }
 
     #[test]

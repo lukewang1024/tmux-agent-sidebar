@@ -116,9 +116,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_ignores_claude_only_events() {
+    fn codex_ignores_unsupported_claude_only_events() {
         let adapter = resolve_adapter("codex").unwrap();
-        assert!(adapter.parse("notification", &json!({})).is_none());
         assert!(adapter.parse("stop-failure", &json!({})).is_none());
         assert!(
             adapter

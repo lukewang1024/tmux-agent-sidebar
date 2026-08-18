@@ -854,6 +854,12 @@ const EXPECTED_FULL_OUTPUT: &str = r#"{
           "trigger": "UserPromptSubmit"
         },
         {
+          "command": "bash /fake/hook.sh codex notification",
+          "event": "notification",
+          "matcher": null,
+          "trigger": "PermissionRequest"
+        },
+        {
           "command": "bash /fake/hook.sh codex stop",
           "event": "stop",
           "matcher": null,
@@ -868,6 +874,17 @@ const EXPECTED_FULL_OUTPUT: &str = r#"{
       ],
       "snippet": {
         "hooks": {
+          "PermissionRequest": [
+            {
+              "hooks": [
+                {
+                  "command": "bash /fake/hook.sh codex notification",
+                  "type": "command"
+                }
+              ],
+              "matcher": ""
+            }
+          ],
           "PostToolUse": [
             {
               "hooks": [
