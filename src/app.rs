@@ -98,6 +98,7 @@ pub fn run(
         };
         if event::poll(timeout)? {
             loop {
+                let mut handled_input = false;
                 match event::read()? {
                     // tmux moved focus off this pane (window/session switch).
                     // Drop the selection highlight immediately so a backgrounded
@@ -125,8 +126,15 @@ pub fn run(
                             && input::handle_event(ev, &mut state, &git_tab_active, terminal)
                         {
                             needs_redraw = true;
+                            handled_input = true;
                         }
                     }
+                }
+                // Give each user input a frame before consuming more queued
+                // events. This keeps selection feedback immediate and avoids
+                // starving rendering behind terminal key-repeat batches.
+                if handled_input {
+                    break;
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
@@ -203,9 +211,6 @@ pub fn run(
             needs_redraw = true;
         }
 
-        state
-            .global
-            .flush_pending_cursor_save(std::time::Duration::from_millis(120));
         state
             .global
             .flush_pending_broadcast(std::time::Duration::from_millis(150));

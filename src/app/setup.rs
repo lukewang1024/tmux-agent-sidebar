@@ -17,7 +17,7 @@ pub(super) fn init_state(tmux_pane: String) -> AppState {
     state.bottom_panel_height = ui::bottom_panel_height_from_tmux();
     state.pet_enabled = ui::pet_enabled_from_tmux();
     state.global.load_from_tmux();
-    state.refresh();
+    state.refresh_blocking();
 
     super::render::refresh_git_for_focused_pane(&mut state);
 
@@ -41,7 +41,7 @@ pub(super) fn init_state(tmux_pane: String) -> AppState {
     // background scan tick.
     state.sessions.names = session::scan_session_names();
     state.sessions.dirty = true;
-    state.refresh();
+    state.refresh_blocking();
 
     state
 }
