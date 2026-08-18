@@ -31,4 +31,27 @@ mod tests {
             other => panic!("expected UserPromptSubmit, got {other:?}"),
         }
     }
+
+    #[test]
+    fn permission_request_marks_traex_user_decision_as_waiting() {
+        let event = TraexAdapter
+            .parse(
+                "notification",
+                &json!({"tool_name": "request_user_input", "session_id": "traex-question"}),
+            )
+            .unwrap();
+        assert_eq!(
+            event,
+            AgentEvent::Notification {
+                agent: TRAEX_AGENT.into(),
+                cwd: "".into(),
+                permission_mode: "".into(),
+                wait_reason: "elicitation_dialog".into(),
+                meta_only: false,
+                worktree: None,
+                agent_id: None,
+                session_id: Some("traex-question".into()),
+            }
+        );
+    }
 }
