@@ -191,9 +191,7 @@ fn pane_nav_down(state: &mut AppState) {
             state.focus_state.focus = Focus::Panes;
         }
         Focus::Panes => {
-            if state.move_pane_selection(1) {
-                state.global.queue_cursor_save();
-            } else if state.bottom_panel_visible() {
+            if !state.move_pane_selection(1) && state.bottom_panel_visible() {
                 // Only descend into the Activity log when it is actually on
                 // screen; when the panel is auto-hidden on a short window,
                 // focus stays on the (full-height) list.
@@ -208,9 +206,7 @@ fn pane_nav_up(state: &mut AppState) {
     match state.focus_state.focus {
         Focus::Filter => {}
         Focus::Panes => {
-            if state.move_pane_selection(-1) {
-                state.global.queue_cursor_save();
-            } else {
+            if !state.move_pane_selection(-1) {
                 state.focus_state.focus = Focus::Filter;
             }
         }

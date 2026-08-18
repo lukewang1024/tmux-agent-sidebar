@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+use std::collections::HashMap;
+
 use crate::event::{AgentEvent, resolve_adapter};
 
 use super::{read_stdin_json, tmux_pane};
@@ -9,6 +12,69 @@ mod notifications;
 
 use context::sync_pane_location;
 use notifications::notification_settings;
+
+fn pane_owns_process(pane: &str, process_id: u32) -> bool {
+    let Ok(pane_pid) = crate::tmux::display_message(pane, "#{pane_pid}")
+        .trim()
+        .parse::<u32>()
+    else {
+        return false;
+    };
+    process_is_descendant_of(process_id, pane_pid)
+}
+
+fn follows_parent_chain<F>(mut process_id: u32, ancestor_id: u32, mut parent_of: F) -> bool
+where
+    F: FnMut(u32) -> Option<u32>,
+{
+    // A normal hook is only a handful of generations below the pane shell.
+    // The bound also protects against corrupt/cyclic process data.
+    for _ in 0..256 {
+        if process_id == ancestor_id {
+            return true;
+        }
+        let Some(parent) = parent_of(process_id) else {
+            return false;
+        };
+        if parent == 0 || parent == process_id {
+            return false;
+        }
+        process_id = parent;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_descendant_of(process_id: u32, ancestor_id: u32) -> bool {
+    follows_parent_chain(process_id, ancestor_id, |pid| {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `comm` is parenthesized and may contain spaces or `)`, so split at
+        // the final `) `; the following fields begin with state then PPID.
+        let (_, fields) = stat.rsplit_once(") ")?;
+        fields.split_whitespace().nth(1)?.parse().ok()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_descendant_of(process_id: u32, ancestor_id: u32) -> bool {
+    // Portable fallback: one lightweight process-table query. Unlike the old
+    // shared ProcessSnapshot scan this does not request or allocate comm/args.
+    let output = std::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid="])
+        .output()
+        .ok();
+    let Some(output) = output.filter(|output| output.status.success()) else {
+        return false;
+    };
+    let parents: HashMap<u32, u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect();
+    follows_parent_chain(process_id, ancestor_id, |pid| parents.get(&pid).copied())
+}
 
 // ─── hook subcommand ────────────────────────────────────────────────────────
 
@@ -25,7 +91,12 @@ pub(crate) fn cmd_hook(args: &[String]) -> i32 {
     };
 
     let pane = tmux_pane();
-    if pane.is_empty() {
+    // TMUX_PANE can survive in an environment after the coding agent has
+    // escaped or been launched outside that pane. Treat it only as a hint:
+    // hooks may write pane state only when this helper is actually a
+    // descendant of the pane's shell process. Otherwise the sidebar would
+    // render a non-navigable ghost entry for an unrelated agent.
+    if pane.is_empty() || !pane_owns_process(&pane, std::process::id()) {
         return 0;
     }
 
@@ -195,5 +266,47 @@ fn handle_event(pane: &str, agent_name: &str, event: AgentEvent) -> i32 {
         } => handlers::on_teammate_idle(pane, &teammate_name, &idle_reason),
         AgentEvent::WorktreeCreate => 0,
         AgentEvent::WorktreeRemove { .. } => handlers::on_worktree_remove(pane),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::follows_parent_chain;
+    use std::collections::HashMap;
+
+    #[test]
+    fn accepts_hook_process_inside_pane_tree() {
+        let parents = HashMap::from([(100, 1), (200, 100), (300, 200)]);
+
+        assert!(follows_parent_chain(300, 100, |pid| parents
+            .get(&pid)
+            .copied()));
+    }
+
+    #[test]
+    fn rejects_process_outside_pane_tree_even_with_stale_pane_env() {
+        let parents = HashMap::from([(100, 1), (200, 100), (400, 1), (500, 400)]);
+
+        assert!(!follows_parent_chain(500, 100, |pid| parents
+            .get(&pid)
+            .copied()));
+    }
+
+    #[test]
+    fn rejects_a_corrupt_parent_cycle() {
+        let parents = HashMap::from([(200, 300), (300, 200)]);
+
+        assert!(!follows_parent_chain(300, 100, |pid| parents
+            .get(&pid)
+            .copied()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_walk_finds_the_real_parent() {
+        assert!(super::process_is_descendant_of(
+            std::process::id(),
+            unsafe { libc::getppid() as u32 },
+        ));
     }
 }

@@ -594,13 +594,14 @@ fn full_sync_applies_filter_from_tmux() {
 }
 
 #[test]
-fn full_sync_applies_cursor_from_tmux() {
+fn full_sync_does_not_apply_cursor_from_tmux() {
     let mut g = make_global();
+    g.selected_pane_row = 2;
 
     let opts = make_opts(&[(tmux::SIDEBAR_CURSOR, "3")]);
     g.apply_all(&opts);
 
-    assert_eq!(g.selected_pane_row, 3);
+    assert_eq!(g.selected_pane_row, 2);
 }
 
 #[test]
@@ -668,8 +669,9 @@ fn full_sync_invalid_filter_defaults_to_all() {
 }
 
 #[test]
-fn full_sync_applies_all_three_from_tmux() {
+fn full_sync_applies_shared_fields_but_keeps_local_cursor() {
     let mut g = make_global();
+    g.selected_pane_row = 2;
 
     let opts = make_opts(&[
         (tmux::SIDEBAR_FILTER, "error"),
@@ -679,7 +681,7 @@ fn full_sync_applies_all_three_from_tmux() {
     g.apply_all(&opts);
 
     assert_eq!(g.status_filter, StatusFilter::Error);
-    assert_eq!(g.selected_pane_row, 7);
+    assert_eq!(g.selected_pane_row, 2);
     assert_eq!(g.repo_filter, RepoFilter::Repo("my-app".into()));
 }
 
@@ -760,19 +762,19 @@ fn full_sync_picks_up_change_from_another_instance() {
 }
 
 #[test]
-fn full_sync_picks_up_cursor_from_another_instance() {
+fn full_sync_keeps_cursor_local_between_instances() {
     let mut g = make_global();
+    g.selected_pane_row = 1;
 
     g.apply_all(&make_opts(&[(tmux::SIDEBAR_CURSOR, "3")]));
-    assert_eq!(g.selected_pane_row, 3);
-    // last_saved_cursor is now 3
+    assert_eq!(g.selected_pane_row, 1);
 
     // Another instance moves cursor to 7
     g.apply_all(&make_opts(&[(tmux::SIDEBAR_CURSOR, "7")]));
 
     assert_eq!(
-        g.selected_pane_row, 7,
-        "SIGUSR1 should pick up cursor changed by another instance"
+        g.selected_pane_row, 1,
+        "SIGUSR1 must not overwrite this instance's cursor"
     );
 }
 
@@ -841,9 +843,10 @@ fn window_active_flicker_does_not_trigger_sync() {
 }
 
 #[test]
-fn window_activation_syncs_all_fields() {
-    // Window activation triggers full sync of filter, cursor, and repo filter.
+fn window_activation_syncs_shared_fields_but_not_cursor() {
+    // Window activation syncs filters while preserving this client's cursor.
     let mut g = make_global();
+    g.selected_pane_row = 2;
 
     g.apply_all(&make_opts(&[
         (tmux::SIDEBAR_FILTER, "idle"),
@@ -852,7 +855,7 @@ fn window_activation_syncs_all_fields() {
     ]));
 
     assert_eq!(g.status_filter, StatusFilter::Idle);
-    assert_eq!(g.selected_pane_row, 4);
+    assert_eq!(g.selected_pane_row, 2);
     assert_eq!(g.repo_filter, RepoFilter::Repo("my-app".into()));
 }
 

@@ -367,7 +367,6 @@ impl AppState {
         let line_index = (row as usize - 2) + self.scrolls.panes.offset;
         if let Some(Some(agent_row)) = self.layout.line_to_row.get(line_index) {
             self.global.selected_pane_row = *agent_row;
-            self.global.queue_cursor_save();
             self.activate_selected_pane();
         }
     }

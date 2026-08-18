@@ -9,16 +9,14 @@ use super::filter::{RepoFilter, StatusFilter};
 /// Synced from tmux at startup and on pane focus change (SIGUSR1).
 pub struct GlobalState {
     pub status_filter: StatusFilter,
+    /// Cursor owned by this frontend process. Unlike filters, it is never
+    /// persisted to tmux or broadcast to peer sidebar instances.
     pub selected_pane_row: usize,
     pub repo_filter: RepoFilter,
     /// Last filter value successfully written to tmux.
     last_saved_filter: StatusFilter,
-    /// Last cursor value successfully written to tmux.
-    last_saved_cursor: usize,
     /// Last repo filter value successfully written to tmux.
     last_saved_repo_filter: RepoFilter,
-    /// When the selected cursor was last changed and still needs persisting.
-    pending_cursor_save_since: Option<Instant>,
     /// When a shared-state write last queued a peer broadcast that still needs
     /// sending. Debounced so rapid changes (e.g. cycling the filter back and
     /// forth) collapse into a single SIGUSR1 fan-out instead of flooding every
@@ -39,9 +37,7 @@ impl GlobalState {
             selected_pane_row: 0,
             repo_filter: RepoFilter::All,
             last_saved_filter: StatusFilter::All,
-            last_saved_cursor: 0,
             last_saved_repo_filter: RepoFilter::All,
-            pending_cursor_save_since: None,
             pending_broadcast_since: None,
         }
     }
@@ -84,52 +80,6 @@ impl GlobalState {
         }
     }
 
-    /// Save cursor position to tmux global variable. Returns `true` when
-    /// tmux accepted the write so callers can decide whether to clear a
-    /// queued save or keep retrying.
-    pub fn save_cursor(&mut self) -> bool {
-        if tmux::run_tmux(&[
-            "set",
-            "-g",
-            tmux::SIDEBAR_CURSOR,
-            &self.selected_pane_row.to_string(),
-        ])
-        .is_some()
-        {
-            self.last_saved_cursor = self.selected_pane_row;
-            self.queue_broadcast();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mark the cursor as dirty so the main loop can persist it once the
-    /// user pauses navigation.
-    pub fn queue_cursor_save(&mut self) {
-        self.pending_cursor_save_since = Some(Instant::now());
-    }
-
-    /// Persist a queued cursor update after it has been idle for at least the
-    /// requested debounce duration. Returns true when the queue was consumed.
-    pub fn flush_pending_cursor_save(&mut self, debounce: std::time::Duration) -> bool {
-        let Some(queued_at) = self.pending_cursor_save_since else {
-            return false;
-        };
-        if queued_at.elapsed() < debounce {
-            return false;
-        }
-        // Only clear the pending marker on successful tmux write — otherwise
-        // a transient failure would silently drop the queued save instead of
-        // retrying on the next flush tick.
-        if self.save_cursor() {
-            self.pending_cursor_save_since = None;
-            true
-        } else {
-            false
-        }
-    }
-
     /// Save repo filter to tmux global variable.
     pub fn save_repo_filter(&mut self) {
         if tmux::run_tmux(&[
@@ -160,13 +110,6 @@ impl GlobalState {
                 self.status_filter = tmux_filter;
                 self.last_saved_filter = tmux_filter;
             }
-        }
-        if let Some(cursor_str) = opts.get(tmux::SIDEBAR_CURSOR)
-            && let Ok(n) = cursor_str.parse::<usize>()
-            && n != self.last_saved_cursor
-        {
-            self.selected_pane_row = n;
-            self.last_saved_cursor = n;
         }
         if let Some(repo_str) = opts.get(tmux::SIDEBAR_REPO_FILTER) {
             let tmux_repo = RepoFilter::from_label(repo_str);

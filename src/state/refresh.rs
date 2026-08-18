@@ -147,9 +147,24 @@ impl AppState {
     /// Returns whether this sidebar belongs to the active window of an
     /// attached tmux session, i.e. whether a user can currently see it.
     pub fn refresh(&mut self) -> bool {
+        self.refresh_with_snapshot(false)
+    }
+
+    pub fn refresh_blocking(&mut self) -> bool {
+        self.refresh_with_snapshot(true)
+    }
+
+    fn refresh_with_snapshot(&mut self, blocking: bool) -> bool {
         self.refresh_now();
-        let shared_response =
-            crate::shared_snapshot::query_sessions(self.shared_snapshot_generation);
+        let shared_response = if blocking {
+            crate::shared_snapshot::query_sessions(self.shared_snapshot_generation)
+        } else {
+            crate::shared_snapshot::query_sessions_async(self.shared_snapshot_generation)
+        };
+        if !blocking && shared_response.is_none() && self.shared_snapshot_generation != 0 {
+            self.refresh_activity_data();
+            return self.last_sidebar_visible;
+        }
         let (pane_active, window_active, session_attached) = shared_response
             .as_ref()
             .and_then(|response| response.sidebar_visibility.get(&self.tmux_pane))
@@ -174,6 +189,7 @@ impl AppState {
         // residual when the user returns to that session.
         let sidebar_focused = pane_active && window_active && session_attached;
         let sidebar_visible = window_active && session_attached;
+        self.last_sidebar_visible = sidebar_visible;
         // Process discovery shells out to `ps -eo` and walks the entire
         // machine's process tree. Pane metadata still refreshes every UI tick,
         // but process discovery is slow-changing and does not need to multiply

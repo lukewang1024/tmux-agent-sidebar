@@ -59,6 +59,9 @@ pub struct AppState {
     pub tmux_pane: String,
     /// Last daemon snapshot generation applied by this frontend.
     pub shared_snapshot_generation: u64,
+    /// Visibility from the last completed snapshot. Reused while the next
+    /// asynchronous snapshot request is in flight.
+    pub last_sidebar_visible: bool,
     /// Scroll offsets for the agents list and git tab. Activity tab
     /// scroll lives in [`ActivityState::scroll`].
     pub scrolls: ScrollStates,
@@ -169,6 +172,7 @@ impl AppState {
             activity: ActivityState::new(),
             tmux_pane,
             shared_snapshot_generation: 0,
+            last_sidebar_visible: true,
             scrolls: ScrollStates::default(),
             theme: ColorTheme::default(),
             icons: StatusIcons::default(),

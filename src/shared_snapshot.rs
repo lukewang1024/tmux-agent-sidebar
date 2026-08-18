@@ -14,6 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -349,10 +350,7 @@ fn spawn_daemon() -> Option<()> {
         .spawn()
         .ok()?;
     // Dropping Child without waiting leaves a zombie once the daemon exits.
-    // That happens frequently when several sidebar instances simultaneously
-    // miss the socket and race to start the singleton: one process wins the
-    // lock and every loser exits immediately. Keep the UI non-blocking while a
-    // tiny reaper thread owns the child until either path finishes.
+    // Reap it off-thread so a socket-start race never blocks the UI.
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -373,6 +371,42 @@ pub(crate) fn query_sessions(generation: u64) -> Option<SnapshotResponse> {
         }
     }
     None
+}
+
+struct AsyncClient {
+    request_tx: mpsc::SyncSender<u64>,
+    response_rx: Mutex<mpsc::Receiver<SnapshotResponse>>,
+}
+
+static ASYNC_CLIENT: OnceLock<AsyncClient> = OnceLock::new();
+
+/// Return the latest completed snapshot while a worker performs all daemon
+/// and tmux I/O. At most one request is queued, so a slow daemon cannot build
+/// an unbounded backlog behind the UI.
+pub(crate) fn query_sessions_async(generation: u64) -> Option<SnapshotResponse> {
+    let client = ASYNC_CLIENT.get_or_init(|| {
+        let (request_tx, request_rx) = mpsc::sync_channel::<u64>(1);
+        let (response_tx, response_rx) = mpsc::sync_channel::<SnapshotResponse>(1);
+        std::thread::spawn(move || {
+            while let Ok(generation) = request_rx.recv() {
+                if let Some(response) = query_sessions(generation) {
+                    let _ = response_tx.try_send(response);
+                }
+            }
+        });
+        AsyncClient {
+            request_tx,
+            response_rx: Mutex::new(response_rx),
+        }
+    });
+
+    let response = client
+        .response_rx
+        .lock()
+        .ok()
+        .and_then(|rx| rx.try_iter().last());
+    let _ = client.request_tx.try_send(generation);
+    response
 }
 
 /// Mark the daemon's global snapshot dirty after an agent or tmux event.
