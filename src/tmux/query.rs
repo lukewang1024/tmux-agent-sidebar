@@ -343,10 +343,12 @@ fn parse_pane_fields_with_processes(
             transcript.to_str().unwrap_or(""),
         );
     }
-    if matches!(agent, AgentType::Codex | AgentType::Traex)
-        && process_discovered
-        && session_id_value.is_empty()
-    {
+    // Keep retrying transcript recovery until the pane has a session id. The
+    // first process scan can run before Codex/TraeX has created its JSONL (or
+    // before lsof can observe it). `@pane_agent` is already persisted by that
+    // scan, so gating later attempts on `process_discovered` strands the pane
+    // as an agent with no session forever and renders it as idle.
+    if matches!(agent, AgentType::Codex | AgentType::Traex) && session_id_value.is_empty() {
         if let Some(active) = find_active_session_transcript(&agent, pane_path) {
             if !codex_session_bound_to_other_pane(&active.session_id, pane_id) {
                 session_id_value = active.session_id;
