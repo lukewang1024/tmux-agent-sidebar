@@ -529,6 +529,11 @@ fn full_output_config_paths() {
             .and_then(Value::as_str),
         Some("~/.codex/hooks.json")
     );
+    assert_eq!(
+        full.pointer("/agents/traex/config_path")
+            .and_then(Value::as_str),
+        Some("~/.trae/cli/hooks.json")
+    );
 }
 
 #[test]

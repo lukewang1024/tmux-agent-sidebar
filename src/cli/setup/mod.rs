@@ -287,7 +287,7 @@ pub(crate) fn build_setup_output(hook_script: &str) -> serde_json::Value {
     );
     let traex = build_agent_entry(
         "traex",
-        "~/.trae/hooks.json",
+        "~/.trae/cli/hooks.json",
         TraexAdapter::HOOK_REGISTRATIONS,
         hook_script,
     );
@@ -410,7 +410,7 @@ pub(crate) fn config_path_for_agent(agent: &str) -> Option<PathBuf> {
     match agent {
         "claude" => Some(home.join(".claude/settings.json")),
         "codex" => Some(home.join(".codex/hooks.json")),
-        "traex" => Some(home.join(".trae/hooks.json")),
+        "traex" => Some(home.join(".trae/cli/hooks.json")),
         _ => None,
     }
 }
