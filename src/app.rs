@@ -168,7 +168,17 @@ pub fn run(
                 crate::shared_snapshot::invalidate();
             }
             let previous_focused_pane_id = state.focus_state.focused_pane_id.clone();
-            sidebar_visible = state.refresh();
+            // Hook and focus signals promise an immediate refresh. The normal
+            // refresh path is deliberately pipelined off-thread for input
+            // responsiveness, so using it here can consume no response, only
+            // enqueue one, and leave the new state invisible until the next
+            // foreground tick. A signal is infrequent and already invalidated
+            // the daemon cache above, so wait for that fresh snapshot now.
+            sidebar_visible = if sigusr1 {
+                state.refresh_blocking()
+            } else {
+                state.refresh()
+            };
             // A SIGUSR1 poke is either a focus hook or a peer broadcasting a
             // shared-state change (status/repo filter, selection cursor). Reload
             // globally-shared options now so the change lands immediately, even
