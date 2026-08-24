@@ -45,6 +45,22 @@ pub(in crate::cli::hook) fn on_stop(
 ) -> i32 {
     set_agent_meta(pane, ctx);
     set_attention(pane, "clear");
+    let bg_shell_live = !tmux::get_pane_option_value(pane, tmux::PANE_BG_CMD).is_empty();
+    // Commit the lifecycle transition before doing transcript-backed response
+    // lookup or desktop notification work. Codex often omits both
+    // `last_assistant_message` and `transcript_path`, so the fallback may need
+    // to scan a large sessions directory and read a large JSONL transcript.
+    // Hook runners have a deadline; if that slow, best-effort work is killed,
+    // the pane must not be left stuck in `running` after the turn completed.
+    tmux::unset_pane_option(pane, tmux::PANE_SUBAGENTS);
+    if bg_shell_live {
+        tmux::unset_pane_option(pane, tmux::PANE_WAIT_REASON);
+    } else {
+        clear_run_state(pane);
+    }
+    mark_task_reset(pane);
+    set_status(pane, resolve_stop_status(bg_shell_live));
+
     let transcript_fallback = if last_message.is_empty() {
         last_assistant_message_from_transcript(transcript_path).or_else(|| {
             ctx.session_id
@@ -68,20 +84,11 @@ pub(in crate::cli::hook) fn on_stop(
         tmux::set_pane_option(pane, tmux::PANE_PROMPT, &msg);
         tmux::set_pane_option(pane, tmux::PANE_PROMPT_SOURCE, "response");
     }
-    let bg_shell_live = !tmux::get_pane_option_value(pane, tmux::PANE_BG_CMD).is_empty();
     // `Stop` is emitted for the parent turn, and Claude Code `Task` subagents
     // are synchronous: once the parent reaches Stop, no child should still be
-    // running. Treat any leftover list as stale state from a missed or
-    // mismatched SubagentStop and clear it before `mark_task_reset`, whose
-    // guard intentionally skips writes while subagents are active.
-    tmux::unset_pane_option(pane, tmux::PANE_SUBAGENTS);
-    if bg_shell_live {
-        tmux::unset_pane_option(pane, tmux::PANE_WAIT_REASON);
-    } else {
-        clear_run_state(pane);
-    }
-    mark_task_reset(pane);
-    set_status(pane, resolve_stop_status(bg_shell_live));
+    // running. The stale subagent list is cleared in the early lifecycle
+    // transition above, before `mark_task_reset`, whose guard intentionally
+    // skips writes while subagents are active.
 
     if !bg_shell_live {
         let run_id = notification_run_id(pane);

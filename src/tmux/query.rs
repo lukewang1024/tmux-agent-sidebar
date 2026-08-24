@@ -375,12 +375,36 @@ fn parse_pane_fields_with_processes(
     } else {
         None
     };
+    // Codex Stop hooks are not guaranteed to run (for example, a hook runner
+    // can be unavailable or time out). The transcript is already the source
+    // of truth for completed Codex turns, so persist that same truth back into
+    // tmux instead of merely rendering an idle row over stale `running`
+    // metadata. This makes every sidebar instance and external tmux consumer
+    // agree after the next refresh.
+    let transcript_completion_status = transcript_completion.as_ref().map(|_| {
+        reconcile_completed_codex_status(pane_id, !parts[pane_line_field::BG_CMD].is_empty())
+    });
     if recovered_live_prompt.is_none()
         && transcript_completion.is_none()
         && session_bound_message
         && !session_id_value.is_empty()
     {
         recovered_live_prompt = session_active_prompt(pane_id, &agent, &session_id_value);
+    }
+    if recovered_live_prompt.is_some()
+        && matches!(stored_status, PaneStatus::Idle | PaneStatus::Unknown)
+    {
+        // Symmetric fallback for a missed UserPromptSubmit hook: an active
+        // transcript proves the pane is running. Do not override richer
+        // waiting/background states that were delivered successfully.
+        set_pane_option(pane_id, PANE_STATUS, "running");
+        if parts[pane_line_field::STARTED_AT].is_empty() {
+            set_pane_option(
+                pane_id,
+                PANE_STARTED_AT,
+                &crate::time::now_epoch_secs().to_string(),
+            );
+        }
     }
     let sanitized_completion = transcript_completion.as_deref().map(sanitize_prompt);
 
@@ -466,7 +490,9 @@ fn parse_pane_fields_with_processes(
         pane_active: parts[pane_line_field::PANE_ACTIVE] == "1",
         status: if recovered_live_prompt.is_some() {
             PaneStatus::Running
-        } else if awaiting_session_id || transcript_completion.is_some() || process_discovered {
+        } else if let Some(status) = transcript_completion_status {
+            status
+        } else if awaiting_session_id || process_discovered {
             PaneStatus::Idle
         } else {
             stored_status
@@ -507,6 +533,20 @@ fn parse_pane_fields_with_processes(
             }
         },
     })
+}
+
+fn reconcile_completed_codex_status(pane_id: &str, background_shell_live: bool) -> PaneStatus {
+    unset_pane_option(pane_id, PANE_ATTENTION);
+    unset_pane_option(pane_id, PANE_SUBAGENTS);
+    unset_pane_option(pane_id, PANE_WAIT_REASON);
+    let (status, label) = if background_shell_live {
+        (PaneStatus::Background, "background")
+    } else {
+        unset_pane_option(pane_id, PANE_STARTED_AT);
+        (PaneStatus::Idle, "idle")
+    };
+    set_pane_option(pane_id, PANE_STATUS, label);
+    status
 }
 
 fn session_completed_response(
@@ -2213,6 +2253,52 @@ mod tests {
         assert!(
             !log.exists(),
             "activity log must be removed when the agent process is gone"
+        );
+    }
+
+    #[test]
+    fn completed_codex_turn_persists_idle_and_clears_run_state() {
+        let _guard = test_mock::install();
+        let pane = "%CODEX_COMPLETED";
+        test_mock::set(pane, PANE_STATUS, "running");
+        test_mock::set(pane, PANE_STARTED_AT, "123");
+        test_mock::set(pane, PANE_WAIT_REASON, "stale");
+        test_mock::set(pane, PANE_ATTENTION, "notification");
+        test_mock::set(pane, PANE_SUBAGENTS, "worker:1");
+
+        assert_eq!(
+            reconcile_completed_codex_status(pane, false),
+            PaneStatus::Idle
+        );
+        assert_eq!(test_mock::get(pane, PANE_STATUS).as_deref(), Some("idle"));
+        for key in &[
+            PANE_STARTED_AT,
+            PANE_WAIT_REASON,
+            PANE_ATTENTION,
+            PANE_SUBAGENTS,
+        ] {
+            assert!(!test_mock::contains(pane, key), "{key} must be cleared");
+        }
+    }
+
+    #[test]
+    fn completed_codex_turn_preserves_live_background_shell_state() {
+        let _guard = test_mock::install();
+        let pane = "%CODEX_COMPLETED_BG";
+        test_mock::set(pane, PANE_STATUS, "running");
+        test_mock::set(pane, PANE_STARTED_AT, "123");
+
+        assert_eq!(
+            reconcile_completed_codex_status(pane, true),
+            PaneStatus::Background
+        );
+        assert_eq!(
+            test_mock::get(pane, PANE_STATUS).as_deref(),
+            Some("background")
+        );
+        assert_eq!(
+            test_mock::get(pane, PANE_STARTED_AT).as_deref(),
+            Some("123")
         );
     }
 
