@@ -186,6 +186,7 @@ impl SidebarCreateLock {
         let path = sidebar_create_lock_path(window_id);
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)

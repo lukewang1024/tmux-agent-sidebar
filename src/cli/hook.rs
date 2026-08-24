@@ -1,5 +1,7 @@
 #[cfg(not(target_os = "linux"))]
 use std::collections::HashMap;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::event::{AgentEvent, resolve_adapter};
 
@@ -21,6 +23,97 @@ fn pane_owns_process(pane: &str, process_id: u32) -> bool {
         return false;
     };
     process_is_descendant_of(process_id, pane_pid)
+}
+
+fn agent_process_name_matches(name: &str, agent: &str) -> bool {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    basename == agent || (agent == "traex" && basename == "traecli")
+}
+
+#[cfg(target_os = "linux")]
+fn parent_and_name(process_id: u32) -> Option<(u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    let (head, fields) = stat.rsplit_once(") ")?;
+    let name = head.split_once('(')?.1.to_string();
+    let parent = fields.split_whitespace().nth(1)?.parse().ok()?;
+    Some((parent, name))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_and_name(process_id: u32) -> Option<(u32, String)> {
+    let output = Command::new("ps")
+        .args(["-p", &process_id.to_string(), "-o", "ppid=,comm="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_whitespace();
+    Some((fields.next()?.parse().ok()?, fields.next()?.to_string()))
+}
+
+fn find_agent_ancestor(mut process_id: u32, agent: &str) -> Option<u32> {
+    for _ in 0..256 {
+        let (parent, name) = parent_and_name(process_id)?;
+        if agent_process_name_matches(&name, agent) {
+            return Some(process_id);
+        }
+        if parent == 0 || parent == process_id {
+            return None;
+        }
+        process_id = parent;
+    }
+    None
+}
+
+fn process_is_alive(process_id: u32) -> bool {
+    unsafe { libc::kill(process_id as libc::pid_t, 0) == 0 }
+}
+
+fn spawn_agent_exit_watcher(pane: &str, agent: &str, session_id: &str) {
+    let Some(agent_pid) = find_agent_ancestor(std::process::id(), agent) else {
+        return;
+    };
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let _ = Command::new(executable)
+        .args([
+            "watch-agent-exit",
+            pane,
+            agent,
+            &agent_pid.to_string(),
+            session_id,
+        ])
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+pub(crate) fn cmd_watch_agent_exit(args: &[String]) -> i32 {
+    let (Some(pane), Some(_agent), Some(pid), Some(session_id)) =
+        (args.first(), args.get(1), args.get(2), args.get(3))
+    else {
+        return 0;
+    };
+    let Ok(pid) = pid.parse::<u32>() else {
+        return 0;
+    };
+    while process_is_alive(pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A /clear or a quickly restarted CLI may reuse the pane while this old
+    // watcher is winding down. Only tear down the session it was created for.
+    if crate::tmux::get_pane_option_value(pane, crate::tmux::PANE_SESSION_ID) != *session_id {
+        return 0;
+    }
+    crate::state::AppState::clear_dead_agent_metadata(pane);
+    crate::shared_snapshot::invalidate();
+    crate::tmux::notify_other_sidebars();
+    0
 }
 
 fn follows_parent_chain<F>(mut process_id: u32, ancestor_id: u32, mut parent_of: F) -> bool
@@ -104,6 +197,14 @@ pub(crate) fn cmd_hook(args: &[String]) -> i32 {
     let Some(event) = adapter.parse(event_name, &input) else {
         return 0;
     };
+
+    if let AgentEvent::SessionStart {
+        agent, session_id, ..
+    } = &event
+        && matches!(agent.as_str(), "codex" | "traex")
+    {
+        spawn_agent_exit_watcher(&pane, agent, session_id.as_deref().unwrap_or(""));
+    }
 
     let should_notify = !matches!(
         &event,
