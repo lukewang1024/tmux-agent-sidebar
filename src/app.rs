@@ -173,21 +173,28 @@ pub fn run(
         }
 
         let sigusr1 = needs_refresh.swap(false, Ordering::Relaxed);
+        let now = std::time::Instant::now();
         if sigusr1 {
-            urgent_refresh_deadline = Some(std::time::Instant::now() + URGENT_REFRESH_TIMEOUT);
+            urgent_refresh_deadline = Some(now + URGENT_REFRESH_TIMEOUT);
             urgent_refresh_epoch = crate::shared_snapshot::next_async_refresh_epoch();
         }
-        let urgent_refresh_pending =
-            urgent_refresh_deadline.is_some_and(|deadline| std::time::Instant::now() < deadline);
+        let urgent_refresh_pending = urgent_refresh_deadline.is_some_and(|deadline| now < deadline);
         if urgent_refresh_deadline.is_some() && !urgent_refresh_pending {
             urgent_refresh_deadline = None;
         }
-        if sigusr1
-            || urgent_refresh_pending
-            || last_refresh.elapsed() >= refresh_interval(sidebar_visible)
-        {
+        let periodic_refresh_due = last_refresh.elapsed() >= refresh_interval(sidebar_visible);
+        // Periodic refreshes use the same bounded pending loop as signals.
+        // Without this, an empty first async read leaves `last_refresh` overdue,
+        // making the next event::poll timeout zero and spinning the UI thread
+        // until the daemon responds.
+        if periodic_refresh_due && urgent_refresh_deadline.is_none() {
+            urgent_refresh_deadline = Some(now + URGENT_REFRESH_TIMEOUT);
+            urgent_refresh_epoch = 0;
+        }
+        let refresh_pending = urgent_refresh_deadline.is_some();
+        if sigusr1 || refresh_pending || periodic_refresh_due {
             let previous_focused_pane_id = state.focus_state.focused_pane_id.clone();
-            let required_epoch = if urgent_refresh_pending {
+            let required_epoch = if refresh_pending {
                 urgent_refresh_epoch
             } else {
                 0
@@ -220,9 +227,11 @@ pub fn run(
                 window_inactive_count = window_inactive_count.saturating_add(1);
             }
             git_tab_active.store(state.bottom_tab == BottomTab::GitStatus, Ordering::Relaxed);
-            if snapshot_ready {
-                last_refresh = std::time::Instant::now();
-            }
+            // Advance the cadence even when the async response is still in
+            // flight. `refresh_pending` supplies the 16ms retry wakeup; leaving
+            // this clock overdue would turn the normal refresh timeout into a
+            // permanent zero-duration busy loop.
+            last_refresh = std::time::Instant::now();
         }
 
         if let Ok(data) = git_rx.try_recv() {
