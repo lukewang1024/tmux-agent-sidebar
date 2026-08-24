@@ -17,6 +17,8 @@ const FOREGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const FOREGROUND_SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const BACKGROUND_SIGNAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const URGENT_REFRESH_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const URGENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn refresh_interval(sidebar_visible: bool) -> Duration {
     if sidebar_visible {
@@ -73,6 +75,8 @@ pub fn run(
     // instance belongs to the window an attached client is actually viewing.
     let mut sidebar_visible = true;
     let mut needs_redraw = true;
+    let mut urgent_refresh_deadline: Option<std::time::Instant> = None;
+    let mut urgent_refresh_epoch = 0;
 
     loop {
         if needs_redraw {
@@ -89,12 +93,18 @@ pub fn run(
             // must not keep waking their event loops five times per second.
             refresh_timeout
         };
+        let urgent_refresh_pending = urgent_refresh_deadline.is_some();
         let timeout = if needs_refresh.load(Ordering::Relaxed) {
             Duration::ZERO
         } else {
-            refresh_timeout
+            let base = refresh_timeout
                 .min(spinner_timeout)
-                .min(signal_poll_interval(sidebar_visible))
+                .min(signal_poll_interval(sidebar_visible));
+            if urgent_refresh_pending {
+                base.min(URGENT_REFRESH_POLL_INTERVAL)
+            } else {
+                base
+            }
         };
         if event::poll(timeout)? {
             loop {
@@ -163,22 +173,30 @@ pub fn run(
         }
 
         let sigusr1 = needs_refresh.swap(false, Ordering::Relaxed);
-        if sigusr1 || last_refresh.elapsed() >= refresh_interval(sidebar_visible) {
-            if sigusr1 {
-                crate::shared_snapshot::invalidate();
-            }
+        if sigusr1 {
+            urgent_refresh_deadline = Some(std::time::Instant::now() + URGENT_REFRESH_TIMEOUT);
+            urgent_refresh_epoch = crate::shared_snapshot::next_async_refresh_epoch();
+        }
+        let urgent_refresh_pending =
+            urgent_refresh_deadline.is_some_and(|deadline| std::time::Instant::now() < deadline);
+        if urgent_refresh_deadline.is_some() && !urgent_refresh_pending {
+            urgent_refresh_deadline = None;
+        }
+        if sigusr1
+            || urgent_refresh_pending
+            || last_refresh.elapsed() >= refresh_interval(sidebar_visible)
+        {
             let previous_focused_pane_id = state.focus_state.focused_pane_id.clone();
-            // Hook and focus signals promise an immediate refresh. The normal
-            // refresh path is deliberately pipelined off-thread for input
-            // responsiveness, so using it here can consume no response, only
-            // enqueue one, and leave the new state invisible until the next
-            // foreground tick. A signal is infrequent and already invalidated
-            // the daemon cache above, so wait for that fresh snapshot now.
-            sidebar_visible = if sigusr1 {
-                state.refresh_blocking()
+            let required_epoch = if urgent_refresh_pending {
+                urgent_refresh_epoch
             } else {
-                state.refresh()
+                0
             };
+            let (new_sidebar_visible, snapshot_ready) = state.refresh(required_epoch);
+            sidebar_visible = new_sidebar_visible;
+            if snapshot_ready {
+                urgent_refresh_deadline = None;
+            }
             // A SIGUSR1 poke is either a focus hook or a peer broadcasting a
             // shared-state change (status/repo filter, selection cursor). Reload
             // globally-shared options now so the change lands immediately, even
@@ -188,21 +206,23 @@ pub fn run(
                 state.global.load_from_tmux();
                 state.rebuild_row_targets();
             }
-            if state.focus_state.focused_pane_id != previous_focused_pane_id {
+            if snapshot_ready && state.focus_state.focused_pane_id != previous_focused_pane_id {
                 render::refresh_git_for_focused_pane(&mut state);
             }
             needs_redraw = true;
-            if sidebar_visible {
+            if snapshot_ready && sidebar_visible {
                 if window_inactive_count >= 2 {
                     state.global.load_from_tmux();
                     state.rebuild_row_targets();
                 }
                 window_inactive_count = 0;
-            } else {
+            } else if snapshot_ready {
                 window_inactive_count = window_inactive_count.saturating_add(1);
             }
             git_tab_active.store(state.bottom_tab == BottomTab::GitStatus, Ordering::Relaxed);
-            last_refresh = std::time::Instant::now();
+            if snapshot_ready {
+                last_refresh = std::time::Instant::now();
+            }
         }
 
         if let Ok(data) = git_rx.try_recv() {

@@ -146,24 +146,32 @@ impl AppState {
     /// Fast refresh: tmux state + activity log (called every 1s).
     /// Returns whether this sidebar belongs to the active window of an
     /// attached tmux session, i.e. whether a user can currently see it.
-    pub fn refresh(&mut self) -> bool {
-        self.refresh_with_snapshot(false)
+    /// Queue/read the shared snapshot without blocking the UI thread.
+    ///
+    /// The second return value reports whether a daemon response was applied.
+    /// Signal-driven refreshes use it to keep polling briefly until the
+    /// off-thread request completes instead of waiting for the next 2s tick.
+    pub fn refresh(&mut self, required_epoch: u64) -> (bool, bool) {
+        self.refresh_with_snapshot(false, required_epoch)
     }
 
     pub fn refresh_blocking(&mut self) -> bool {
-        self.refresh_with_snapshot(true)
+        self.refresh_with_snapshot(true, 0).0
     }
 
-    fn refresh_with_snapshot(&mut self, blocking: bool) -> bool {
+    fn refresh_with_snapshot(&mut self, blocking: bool, required_epoch: u64) -> (bool, bool) {
         self.refresh_now();
         let shared_response = if blocking {
             crate::shared_snapshot::query_sessions(self.shared_snapshot_generation)
         } else {
-            crate::shared_snapshot::query_sessions_async(self.shared_snapshot_generation)
+            crate::shared_snapshot::query_sessions_async(
+                self.shared_snapshot_generation,
+                required_epoch,
+            )
         };
         if !blocking && shared_response.is_none() && self.shared_snapshot_generation != 0 {
             self.refresh_activity_data();
-            return self.last_sidebar_visible;
+            return (self.last_sidebar_visible, false);
         }
         let (pane_active, window_active, session_attached) = shared_response
             .as_ref()
@@ -247,7 +255,7 @@ impl AppState {
             self.sessions.dirty = false;
         }
         self.refresh_activity_data();
-        sidebar_visible
+        (sidebar_visible, true)
     }
 
     /// Apply the current `session_id → name` map to each pane so the

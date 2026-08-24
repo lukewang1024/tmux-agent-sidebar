@@ -14,7 +14,11 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -374,23 +378,34 @@ pub(crate) fn query_sessions(generation: u64) -> Option<SnapshotResponse> {
 }
 
 struct AsyncClient {
-    request_tx: mpsc::SyncSender<u64>,
-    response_rx: Mutex<mpsc::Receiver<SnapshotResponse>>,
+    request_tx: mpsc::SyncSender<(u64, u64)>,
+    response_rx: Mutex<mpsc::Receiver<(u64, SnapshotResponse)>>,
 }
 
 static ASYNC_CLIENT: OnceLock<AsyncClient> = OnceLock::new();
+static ASYNC_REFRESH_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Start a new logical async refresh. Responses from requests queued before
+/// this epoch must not satisfy the caller: they may contain the exact stale
+/// snapshot that triggered the signal.
+pub(crate) fn next_async_refresh_epoch() -> u64 {
+    ASYNC_REFRESH_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// Return the latest completed snapshot while a worker performs all daemon
 /// and tmux I/O. At most one request is queued, so a slow daemon cannot build
 /// an unbounded backlog behind the UI.
-pub(crate) fn query_sessions_async(generation: u64) -> Option<SnapshotResponse> {
+pub(crate) fn query_sessions_async(
+    generation: u64,
+    required_epoch: u64,
+) -> Option<SnapshotResponse> {
     let client = ASYNC_CLIENT.get_or_init(|| {
-        let (request_tx, request_rx) = mpsc::sync_channel::<u64>(1);
-        let (response_tx, response_rx) = mpsc::sync_channel::<SnapshotResponse>(1);
+        let (request_tx, request_rx) = mpsc::sync_channel::<(u64, u64)>(1);
+        let (response_tx, response_rx) = mpsc::sync_channel::<(u64, SnapshotResponse)>(1);
         std::thread::spawn(move || {
-            while let Ok(generation) = request_rx.recv() {
+            while let Ok((epoch, generation)) = request_rx.recv() {
                 if let Some(response) = query_sessions(generation) {
-                    let _ = response_tx.try_send(response);
+                    let _ = response_tx.try_send((epoch, response));
                 }
             }
         });
@@ -400,12 +415,13 @@ pub(crate) fn query_sessions_async(generation: u64) -> Option<SnapshotResponse> 
         }
     });
 
-    let response = client
-        .response_rx
-        .lock()
-        .ok()
-        .and_then(|rx| rx.try_iter().last());
-    let _ = client.request_tx.try_send(generation);
+    let response = client.response_rx.lock().ok().and_then(|rx| {
+        rx.try_iter()
+            .filter(|(epoch, _)| *epoch >= required_epoch)
+            .last()
+            .map(|(_, response)| response)
+    });
+    let _ = client.request_tx.try_send((required_epoch, generation));
     response
 }
 
