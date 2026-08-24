@@ -299,12 +299,12 @@ fn notification_backend_available() -> bool {
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        return run_notification_command(
+        run_notification_command(
             &mut command,
             "notify-send",
             DESKTOP_NOTIFICATION_PROBE_TIMEOUT,
         )
-        .is_ok();
+        .is_ok()
     }
 
     #[cfg(target_os = "windows")]

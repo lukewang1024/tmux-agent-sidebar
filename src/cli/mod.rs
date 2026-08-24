@@ -19,6 +19,7 @@ pub fn run(args: &[String]) -> Option<i32> {
     let code = match cmd {
         "setup" => setup::cmd_setup(rest),
         "hook" => hook::cmd_hook(rest),
+        "watch-agent-exit" => hook::cmd_watch_agent_exit(rest),
         "toggle" => toggle::cmd_toggle(rest),
         "toggle-all" => toggle::cmd_toggle_all(rest),
         "maintain-width" => toggle::cmd_maintain_width(rest),

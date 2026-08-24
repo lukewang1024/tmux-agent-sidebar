@@ -204,12 +204,12 @@ fn build_session_hierarchy(
         // Deduplicate panes shared across grouped sessions:
         // same pane_pid may appear in multiple sessions, keep only
         // the first occurrence. pane_pid is at index 13 in pane_fields.
-        if let Some(pid_str) = pane_fields.get(pane_line_field::PANE_PID) {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                if pid != 0 && !seen_pids.insert(pid) {
-                    continue;
-                }
-            }
+        if let Some(pid_str) = pane_fields.get(pane_line_field::PANE_PID)
+            && let Ok(pid) = pid_str.parse::<u32>()
+            && pid != 0
+            && !seen_pids.insert(pid)
+        {
+            continue;
         }
 
         let sessions_entry = sessions_map.entry(session_name.to_string()).or_default();
@@ -348,22 +348,22 @@ fn parse_pane_fields_with_processes(
     // before lsof can observe it). `@pane_agent` is already persisted by that
     // scan, so gating later attempts on `process_discovered` strands the pane
     // as an agent with no session forever and renders it as idle.
-    if matches!(agent, AgentType::Codex | AgentType::Traex) && session_id_value.is_empty() {
-        if let Some(active) = find_active_session_transcript(&agent, pane_path) {
-            if !codex_session_bound_to_other_pane(&active.session_id, pane_id) {
-                session_id_value = active.session_id;
-                recovered_live_prompt = Some(active.prompt);
-                set_pane_option(pane_id, PANE_AGENT, agent.as_str());
-                set_pane_option(pane_id, PANE_CWD, pane_path);
-                set_pane_option(pane_id, PANE_SESSION_ID, &session_id_value);
-                set_pane_option(
-                    pane_id,
-                    PANE_TRANSCRIPT_PATH,
-                    active.path.to_str().unwrap_or(""),
-                );
-                set_pane_option(pane_id, PANE_STATUS, "running");
-            }
-        }
+    if matches!(agent, AgentType::Codex | AgentType::Traex)
+        && session_id_value.is_empty()
+        && let Some(active) = find_active_session_transcript(&agent, pane_path)
+        && !codex_session_bound_to_other_pane(&active.session_id, pane_id)
+    {
+        session_id_value = active.session_id;
+        recovered_live_prompt = Some(active.prompt);
+        set_pane_option(pane_id, PANE_AGENT, agent.as_str());
+        set_pane_option(pane_id, PANE_CWD, pane_path);
+        set_pane_option(pane_id, PANE_SESSION_ID, &session_id_value);
+        set_pane_option(
+            pane_id,
+            PANE_TRANSCRIPT_PATH,
+            active.path.to_str().unwrap_or(""),
+        );
+        set_pane_option(pane_id, PANE_STATUS, "running");
     }
     let session_bound_message = matches!(agent, AgentType::Codex | AgentType::Traex);
     let awaiting_session_id = session_bound_message && session_id_value.is_empty();
@@ -782,7 +782,7 @@ fn codex_prompt_message(value: &serde_json::Value) -> Option<String> {
         "user" if !is_synthetic_context_message(text) => {
             (!text.is_empty()).then(|| text.to_string())
         }
-        "developer" => extract_untrusted_objective(&text).map(str::to_string),
+        "developer" => extract_untrusted_objective(text).map(str::to_string),
         _ => None,
     }
 }

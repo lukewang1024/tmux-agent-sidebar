@@ -30,7 +30,7 @@ use crate::tmux::{self, SessionInfo};
 
 const PROTOCOL_VERSION: u8 = 2;
 /// Bump when daemon cache semantics change without a wire-format change.
-const DAEMON_CACHE_REVISION: u8 = 1;
+const DAEMON_CACHE_REVISION: u8 = 2;
 const REQUEST_SNAPSHOT: u8 = 1;
 const REQUEST_INVALIDATE: u8 = 2;
 // Codex has no reliable lifecycle hooks before its first prompt or when its
@@ -122,6 +122,10 @@ impl SnapshotCache {
         if process_due {
             let (mut sessions, mut processes) = tmux::query_sessions_with_process_snapshot();
             crate::state::sweep_dead_bg_shells(&mut sessions, &mut processes);
+            if let Some(processes) = processes.as_ref() {
+                let live_agent_panes = live_agent_panes(&sessions, processes);
+                clear_and_filter_dead_agent_panes(&mut sessions, &live_agent_panes);
+            }
             self.sessions = sessions;
             if processes.is_some() {
                 self.processes = processes;
@@ -139,19 +143,6 @@ impl SnapshotCache {
             if let Some(scanned) =
                 crate::port::scan_session_process_snapshot(&self.sessions, self.processes.as_ref())
             {
-                for session in &self.sessions {
-                    for window in &session.windows {
-                        for pane in &window.panes {
-                            if !scanned.live_agent_panes.contains(&pane.pane_id) {
-                                AppState::clear_dead_agent_metadata(&pane.pane_id);
-                            }
-                        }
-                    }
-                }
-                self.sessions = AppState::filter_sessions_to_live_agent_panes(
-                    std::mem::take(&mut self.sessions),
-                    &scanned.live_agent_panes,
-                );
                 self.pane_processes = Some(scanned);
             }
             self.last_port_refresh = Some(Instant::now());
@@ -161,6 +152,39 @@ impl SnapshotCache {
         self.generation = self.generation.wrapping_add(1);
         self.dirty = false;
     }
+}
+
+fn live_agent_panes(
+    sessions: &[SessionInfo],
+    processes: &ProcessSnapshot,
+) -> std::collections::HashSet<String> {
+    sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .filter(|pane| {
+            pane.pane_pid
+                .is_some_and(|pid| processes.tree_has_agent(&[pid], &pane.agent))
+        })
+        .map(|pane| pane.pane_id.clone())
+        .collect()
+}
+
+fn clear_and_filter_dead_agent_panes(
+    sessions: &mut Vec<SessionInfo>,
+    live_agent_panes: &std::collections::HashSet<String>,
+) {
+    for pane in sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+    {
+        if !live_agent_panes.contains(&pane.pane_id) {
+            AppState::clear_dead_agent_metadata(&pane.pane_id);
+        }
+    }
+    *sessions =
+        AppState::filter_sessions_to_live_agent_panes(std::mem::take(sessions), live_agent_panes);
 }
 
 fn query_sidebar_visibility() -> HashMap<String, SidebarVisibility> {
