@@ -1,7 +1,13 @@
+#[cfg(not(test))]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(test))]
+use std::sync::{Mutex, OnceLock};
+#[cfg(not(test))]
+use std::time::{Duration, Instant};
 
 use crate::process::{ProcessSnapshot, command_basename, process_matches_agent};
 
@@ -329,10 +335,14 @@ fn parse_pane_fields_with_processes(
     };
     let mut session_id_value = parts[pane_line_field::SESSION_ID].clone();
     let mut recovered_live_prompt = None;
-    if let (Some(pid), Some(snapshot)) = (pane_pid, process_snapshot)
+    // Hooks persist the binding for normal session starts. Recovery is only a
+    // fallback for hookless/early-start panes, and scanning a multi-GB session
+    // tree every two seconds can starve new TUIs, so retry it at a low cadence.
+    let transcript_recovery_due = session_id_value.is_empty() && transcript_recovery_due(pane_id);
+    if transcript_recovery_due
+        && let (Some(pid), Some(snapshot)) = (pane_pid, process_snapshot)
         && let Some(transcript) = process_open_session_transcript(&agent, pid, snapshot)
         && let Some(bound_session_id) = transcript_session_id(&transcript)
-        && session_id_value != bound_session_id
     {
         session_id_value = bound_session_id;
         set_pane_option(pane_id, PANE_AGENT, agent.as_str());
@@ -350,6 +360,7 @@ fn parse_pane_fields_with_processes(
     // as an agent with no session forever and renders it as idle.
     if matches!(agent, AgentType::Codex | AgentType::Traex)
         && session_id_value.is_empty()
+        && transcript_recovery_due
         && let Some(active) = find_active_session_transcript(&agent, pane_path)
         && !codex_session_bound_to_other_pane(&active.session_id, pane_id)
     {
@@ -533,6 +544,35 @@ fn parse_pane_fields_with_processes(
             }
         },
     })
+}
+
+fn transcript_recovery_due(pane_id: &str) -> bool {
+    #[cfg(test)]
+    {
+        let _ = pane_id;
+        true
+    }
+
+    #[cfg(not(test))]
+    {
+        const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+        static LAST_ATTEMPTS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        let now = Instant::now();
+        let Ok(mut attempts) = LAST_ATTEMPTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        else {
+            return false;
+        };
+        let due = attempts
+            .get(pane_id)
+            .is_none_or(|last| now.duration_since(*last) >= RETRY_INTERVAL);
+        if due {
+            attempts.insert(pane_id.to_string(), now);
+            attempts.retain(|_, last| now.duration_since(*last) < RETRY_INTERVAL * 2);
+        }
+        due
+    }
 }
 
 fn reconcile_completed_codex_status(pane_id: &str, background_shell_live: bool) -> PaneStatus {

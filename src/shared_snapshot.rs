@@ -257,33 +257,29 @@ fn runtime_path(extension: &str) -> PathBuf {
     ))
 }
 
-fn daemon_is_alive(pid: i32) -> bool {
-    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
-}
-
 fn acquire_lock() -> io::Result<Option<(std::fs::File, DaemonGuard)>> {
     let socket = runtime_path("sock");
     let lock = runtime_path("lock");
-    for _ in 0..2 {
-        match OpenOptions::new().write(true).create_new(true).open(&lock) {
-            Ok(mut file) => {
-                writeln!(file, "{}", std::process::id())?;
-                return Ok(Some((file, DaemonGuard { socket, lock })));
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                let live_owner = fs::read_to_string(&lock)
-                    .ok()
-                    .and_then(|text| text.trim().parse::<i32>().ok())
-                    .is_some_and(daemon_is_alive);
-                if live_owner {
-                    return Ok(None);
-                }
-                let _ = fs::remove_file(&lock);
-            }
-            Err(err) => return Err(err),
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)?;
+    // create_new + writing the PID has a race: another starter can observe the
+    // newly-created but still-empty file, delete it as stale, and become a
+    // second daemon. An advisory lock is acquired atomically by the kernel and
+    // is released automatically if the owner exits.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if locked != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
         }
+        return Err(err);
     }
-    Ok(None)
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(Some((file, DaemonGuard { socket, lock })))
 }
 
 /// Run the singleton snapshot daemon. Invoked by the hidden `daemon` CLI
